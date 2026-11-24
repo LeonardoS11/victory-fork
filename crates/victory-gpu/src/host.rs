@@ -4694,21 +4694,35 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`);
+        // a list's prelude and the compare of the card's copies are groups
+        // of their own, their time summed as ours (they hold no notes).
+        // Each group: its lists, the run it is (None: ours), what ours is.
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
+        let groups: Vec<(&[Option<ID3D12CommandList>], Option<usize>, &'static str)> = if timing() {
+            let check_at = card.as_ref().and_then(|c| c.check.as_ref()).map(|_| lists.len() - 1);
+            let runs_end = check_at.unwrap_or(lists.len());
+            let mut g = Vec::new();
+            for (k, &a) in firsts.iter().enumerate() {
+                let b = firsts.get(k + 1).copied().unwrap_or(runs_end);
+                if b - a == 2 {
+                    g.push((&lists[a..a + 1], None, "ours: prelude"));
+                    g.push((&lists[a + 1..b], Some(k), ""));
+                } else {
+                    g.push((&lists[a..b], Some(k), ""));
+                }
+            }
+            if let Some(c) = check_at {
+                g.push((&lists[c..c + 1], None, "ours: card compare"));
+            }
+            g
         } else {
-            vec![&lists[..]]
+            vec![(&lists[..], None, "")]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [(&lists[..], None::<usize>, "")];
         submitting(2, runs.len());
-        for (i, group) in groups.iter().enumerate() {
+        for &(group, run, ours) in groups.iter() {
             *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
@@ -4734,17 +4748,26 @@ impl Host {
             // command's time on the card goes to the sums by pipeline.
             #[cfg(feature = "diagnostics")]
             if timing() {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
-                    crate::copystat::command_took(&op, ms);
+                match run {
+                    Some(i) => {
+                        // SAFETY: a plain query.
+                        let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                        for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
+                            crate::copystat::command_took(&op, ms);
+                        }
+                    }
+                    None if !ours.is_empty() => crate::copystat::command_took(ours, started.elapsed().as_secs_f64() * 1e3),
+                    None => {}
                 }
             }
             // A submission of one list was never named here (`groups.len()
             // > 1` was the test): the two 50 ms lists of the gameplay
             // frame, each a submission of its own, printed nothing.
             #[cfg(feature = "diagnostics")]
-            if timing() && started.elapsed() > std::time::Duration::from_millis(50) {
+            if let Some(i) = run
+                && timing()
+                && started.elapsed() > std::time::Duration::from_millis(50)
+            {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -4753,7 +4776,7 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
-            let _ = (i, started);
+            let _ = (run, ours, started);
         }
         let _ = &firsts;
         FINISHED.store(this_submission, Ordering::Release);

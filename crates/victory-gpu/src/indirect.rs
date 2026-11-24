@@ -270,6 +270,9 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    // (timed as ours with `VICTORY_GPU_TIMING`: the dispatch and its two waits)
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("ours: indirect clamp of {} records", spec.2));
     record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
 }
 
@@ -290,6 +293,8 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("ours: indirect clamp ahead of {} records", spec.2));
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
