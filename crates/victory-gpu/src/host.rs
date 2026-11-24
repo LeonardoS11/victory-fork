@@ -6720,7 +6720,12 @@ impl HostList {
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         // A frame shot times the command: the card's clock before it.
         crate::shot::stamp(self);
-        if !dred_on() {
+        // The notes, with their timestamps, are what `VICTORY_GPU_TIMING`
+        // reports by pipeline: kept with the timing on too (only with
+        // `VICTORY_D3D12_DRED` before, so the timing alone logged
+        // `commands=0` and named nothing; upstream #1735). The markers are
+        // only for the device-removed report.
+        if !dred_on() && !timing() {
             crate::capture::op(std::ptr::from_ref(self) as usize, what);
             return;
         }
@@ -6733,12 +6738,14 @@ impl HostList {
             }
             let what = what();
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
-            let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
-            const UNICODE: u32 = 0;
-            // SAFETY: an open list; the marker is copied when recorded.
-            unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
-            };
+            if dred_on() {
+                let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
+                const UNICODE: u32 = 0;
+                // SAFETY: an open list; the marker is copied when recorded.
+                unsafe {
+                    self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                };
+            }
             self.notes
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
