@@ -792,20 +792,26 @@ pub(crate) static HANDED_OFF: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(windows)]
 fn release_held_now_with(all: bool, hand_off: bool) {
     loop {
-        release_turn(all, hand_off && !all && release_handoff());
-        if !(hand_off && release_handoff() && AGAIN.swap(false, Ordering::SeqCst)) {
+        // Only a thread that took the turn looks again for parts left to
+        // it: one that left its part (no turn taken) is done. (It looked
+        // again too, at its own mark, and so spun as long as the other held
+        // the turn: millions of rounds a frame, run B3.)
+        let took = release_turn(all, hand_off && !all && release_handoff());
+        if !(took && hand_off && release_handoff() && AGAIN.swap(false, Ordering::SeqCst)) {
             break;
         }
         HANDED_OFF[1].fetch_add(1, Ordering::Relaxed);
     }
 }
 
+/// One turn of releasing; false if the turn was left to another thread
+/// (or there was nothing to release).
 #[cfg(windows)]
-fn release_turn(all: bool, hand_off: bool) {
+fn release_turn(all: bool, hand_off: bool) -> bool {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
-        return;
+        return false;
     }
     let _one = if hand_off {
         match RELEASING.try_lock() {
@@ -820,7 +826,7 @@ fn release_turn(all: bool, hand_off: bool) {
                     Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                     Err(std::sync::TryLockError::WouldBlock) => {
                         HANDED_OFF[0].fetch_add(1, Ordering::Relaxed);
-                        return;
+                        return false;
                     }
                 }
             }
@@ -1027,6 +1033,7 @@ fn release_turn(all: bool, hand_off: bool) {
             send_joined(&mut joined);
         }
     }
+    true
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with

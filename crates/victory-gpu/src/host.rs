@@ -8388,12 +8388,34 @@ impl Meter {
             let d: Vec<f64> = now.iter().zip(&SEEN).map(|(n, s)| (n - s.swap(*n, Ordering::Relaxed)) as f64 / frames).collect();
             if d.iter().any(|&v| v > 0.0) {
                 tracing::info!(
-                    "per frame: {:.1} parts left to the thread releasing the queues' lines (VICTORY_RELEASE_HANDOFF=1),                      {:.1} turns it took again for them; {:.1} frame waits that did not sleep (VICTORY_PACE_FREE=1)",
+                    "per frame: {:.1} parts left to the thread releasing the queues' lines (VICTORY_RELEASE_HANDOFF=1), \
+                     {:.1} turns it took again for them; {:.1} frame waits that did not sleep (VICTORY_PACE_FREE=1)",
                     d[0],
                     d[1],
                     d[2]
                 );
             }
+            // Which frame waits sleep, and how long (per frame).
+            let s: Vec<[f64; 4]> = crate::frame::SLEPT
+                .iter()
+                .map(|k| [0, 1, 2, 3].map(|i| k[i].swap(0, Ordering::Relaxed) as f64 / frames))
+                .collect();
+            tracing::info!(
+                "frame waits per frame that slept, by kind (origin, vblank, flip and later): blocking {:.1}/{:.1}/{:.1} \
+                 waits {:.2}/{:.2}/{:.2} ms; polls {:.1}/{:.1}/{:.1} waits {:.2}/{:.2}/{:.2} ms",
+                s[0][0],
+                s[1][0],
+                s[2][0],
+                s[0][1] / 1e3,
+                s[1][1] / 1e3,
+                s[2][1] / 1e3,
+                s[0][2],
+                s[1][2],
+                s[2][2],
+                s[0][3] / 1e3,
+                s[1][3] / 1e3,
+                s[2][3] / 1e3
+            );
         }
         {
             let [plan_us, mirror_ns, copy_ns, keep_ns, timed] =

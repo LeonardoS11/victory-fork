@@ -99,25 +99,32 @@ fn pace_free() -> bool {
 /// Waits that did not sleep since the start ([`pace_free`]).
 pub(crate) static PACE_FREED: AtomicU64 = AtomicU64::new(0);
 
-/// The time between the last two origin waits, in microseconds, and when
-/// the last one was.
-static ORIGINS: std::sync::Mutex<(Option<Instant>, u64)> = std::sync::Mutex::new((None, 0));
+/// The time between the last two presents, in microseconds, and when the
+/// last one was. (Measured from origin waits first: the title waits for an
+/// origin more than once a frame, so the time between two was short and
+/// frames never counted slow: 0.0-0.3 waits a frame did not sleep, run B3.)
+static PRESENTS: std::sync::Mutex<(Option<Instant>, u64)> = std::sync::Mutex::new((None, 0));
 
-fn note_origin() {
-    let mut o = ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
+fn note_present() {
+    let mut p = PRESENTS.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    if let Some(before) = o.0 {
-        o.1 = now.duration_since(before).as_micros() as u64;
+    if let Some(before) = p.0 {
+        p.1 = now.duration_since(before).as_micros() as u64;
     }
-    o.0 = Some(now);
+    p.0 = Some(now);
 }
 
-/// Whether the last frame (origin to origin) took more than two ticks.
+/// Whether the last frame (present to present) took more than two ticks.
 fn frames_slow() -> bool {
     let interval = clock().as_ref().map_or(SIXTIETH, |c| c.interval);
-    let last = ORIGINS.lock().unwrap_or_else(|e| e.into_inner()).1;
+    let last = PRESENTS.lock().unwrap_or_else(|e| e.into_inner()).1;
     last > 2 * interval.as_micros() as u64
 }
+
+/// Since the last frame line, per event kind (origin, vblank, flip and
+/// later kinds): blocking waits that slept and their microseconds, polls
+/// (a time-out shorter than the time to the tick) and their microseconds.
+pub(crate) static SLEPT: [[AtomicU64; 4]; 3] = [const { [const { AtomicU64::new(0) }; 4] }; 3];
 
 /// Per event kind (origin, vblank, flip and later kinds): the last tick a
 /// wait for it ended on.
@@ -187,6 +194,16 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
         PACE_FREED.fetch_add(1, Ordering::Relaxed);
     }
+    {
+        let k = &SLEPT[(kind as usize).min(2)];
+        if wait > limit {
+            k[2].fetch_add(1, Ordering::Relaxed);
+            k[3].fetch_add(limit.as_micros() as u64, Ordering::Relaxed);
+        } else if wait > Duration::ZERO {
+            k[0].fetch_add(1, Ordering::Relaxed);
+            k[1].fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
+        }
+    }
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT
@@ -206,9 +223,6 @@ pub(crate) extern "system" fn wait(
         use crate::copystat::{C, add};
         add(C::PaceWaits, 1);
         add(C::PaceUs, wait.min(limit).as_micros() as u64);
-    }
-    if origin {
-        note_origin();
     }
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
@@ -275,6 +289,7 @@ fn issued(token: u64) {
 
 /// `PresentX` flipped the frame of `token` (0: a present without a frame).
 pub(crate) fn flipped(token: u64) {
+    note_present();
     if token == 0 {
         return;
     }
