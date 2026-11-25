@@ -108,6 +108,21 @@ static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// copies in place had won).
 const LEAST: usize = 256;
 
+/// [`LEAST`], or `VICTORY_PLAIN_LEAST` bytes. Copies under it went through
+/// the kernel: 5,000-6,200 a frame in the world (Series S, run F3), some
+/// 2.7 ms of the submitting thread. A copy from a block that faulted
+/// lately is left to the kernel all the same ([`faulted_lately`]), so the
+/// askings that fail cost one fault per block every two seconds.
+fn least() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_PLAIN_LEAST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(LEAST)
+    })
+}
+
 /// The 64 KiB blocks of title memory a copy in place faulted in lately:
 /// their copies go straight to the kernel's, which reads round the hole.
 /// By the block's number, in the place its low bits name (a later block
@@ -261,7 +276,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
+    if len < least() {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }

@@ -7978,7 +7978,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    // Into title memory (a copy between title buffers), with
+    // `VICTORY_TITLE_COPY_PLAIN=1`: read in place into scratch memory, then
+    // written in place (both stop at a page that is not there, and the
+    // kernel's copy does it then).
+    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len))
+        || (title_dst && title_copy_plain() && title_copy_in_place(dst, src, len))
+        || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -8007,6 +8013,30 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+/// Whether copies between title buffers are made in place
+/// (`VICTORY_TITLE_COPY_PLAIN=1`, with `VICTORY_COPY_PLAIN=1`; off by
+/// default): they went through the kernel's copy.
+fn title_copy_plain() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_COPY_PLAIN").is_some_and(|v| v == "1"))
+}
+
+/// Title memory `src` into title memory `dst` in place, through scratch
+/// memory of this thread: false, with `dst` perhaps written in part, if a
+/// page of either was not there (the caller copies through the kernel).
+fn title_copy_in_place(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.len() < len {
+            s.resize(len, 0);
+        }
+        crate::plaincopy::copy(s.as_mut_ptr(), src, len) && crate::plaincopy::write(dst, s.as_ptr(), len)
+    })
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
