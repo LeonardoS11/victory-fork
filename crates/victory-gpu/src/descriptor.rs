@@ -203,6 +203,10 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // `VICTORY_COPIED_WAIT=1`: the records that waited long enough.
+        if host::copied_wait() {
+            host.mirror_waited(start, step);
+        }
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -287,6 +291,15 @@ pub(crate) fn sync_line(frames: f64) {
         tracing::info!(
             "of those mirrored per frame: {remade:.1} made their slot again, {same:.1} named the view it was made \
              from (skipped)"
+        );
+    }
+    if host::copied_wait() {
+        let [waited, made, tabled, none] =
+            [0, 1, 2, 3].map(|i| host::COPIED_WAIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "copied records waiting (VICTORY_COPIED_WAIT=1), per frame: {waited:.1} buffer or placed-texture views set \
+             waiting, {made:.1} mirrored after their wait, {tabled:.1} left to draws that read them through a table \
+             meanwhile; {none:.1} records that were no view looked at under made"
         );
     }
     if !host::tabled_defer() && host::census_on() {

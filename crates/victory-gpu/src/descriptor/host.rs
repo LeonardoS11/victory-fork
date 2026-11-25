@@ -98,6 +98,10 @@ pub(crate) struct HostHeap {
     defer: std::sync::atomic::AtomicBool,
     /// The frame of the last [`HostHeap::sweep_pending`] (plus one).
     swept: std::sync::atomic::AtomicU64,
+    /// `VICTORY_COPIED_WAIT=1`: buffer and placed-texture records copied in
+    /// as bytes, by the frame they were found in, mirrored
+    /// [`copied_grace`] frames later ([`HostHeap::mirror_waited`]).
+    waiting: Mutex<std::collections::VecDeque<(u64, Vec<u32>)>>,
     /// The frame of the last [`HostHeap::census_pending`] (plus one).
     censused: std::sync::atomic::AtomicU64,
     /// Per title slot, the frame (plus one) a draw last bound a table
@@ -1020,6 +1024,7 @@ impl HostHeap {
             pending: Pending::new(if sampler { 0 } else { count }),
             defer: std::sync::atomic::AtomicBool::new(tabled_defer()),
             swept: std::sync::atomic::AtomicU64::new(0),
+            waiting: Mutex::default(),
             censused: std::sync::atomic::AtomicU64::new(0),
             table_seen: (0..if sampler || !census_on() { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
@@ -2003,6 +2008,8 @@ impl HostHeap {
         page: &[u8],
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
+        let waits = copied_wait() && !self.sampler;
+        let mut wait: Vec<u32> = Vec::new();
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64, u64)> = Vec::new();
         // Never raw-copied slots whose record is all zeros: as in
@@ -2048,6 +2055,27 @@ impl HostHeap {
                     }
                     continue;
                 }
+                // `VICTORY_COPIED_WAIT=1` (after fork avatarmanz's
+                // deferral of copied records): a new buffer or
+                // placed-texture view waits [`copied_grace`] frames for a
+                // draw's table to claim it; a record that is no view is
+                // looked at under `made`, as a zeroed one is.
+                if waits {
+                    let word = |n: usize| {
+                        record.get(4 * n..4 * n + 4).and_then(|b| b.try_into().ok()).map_or(0, u32::from_le_bytes)
+                    };
+                    if word(0) == VIEW_TAG {
+                        if matches!(word(2) >> super::KIND_SHIFT, super::CONSTANT | super::PLACED) {
+                            *last = print;
+                            wait.push(index as u32);
+                            continue;
+                        }
+                    } else if !zero {
+                        zeroed.push((index as u32, handle, print));
+                        COPIED_WAIT[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
                 if zero {
                     zeroed.push((index as u32, handle, print));
                     continue;
@@ -2055,6 +2083,10 @@ impl HostHeap {
                 *last = print;
                 due.push((index as u32, handle, print));
             }
+        }
+        if !wait.is_empty() {
+            COPIED_WAIT[0].fetch_add(wait.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, wait));
         }
         if !zeroed.is_empty() {
             zeroed.retain(|&(index, _, _)| self.made.get(index).is_some_and(|key| key != 0));
@@ -2076,6 +2108,41 @@ impl HostHeap {
             COPIED_REMADE[usize::from(!remade)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         (looked, due.len() as u64)
+    }
+
+    /// `VICTORY_COPIED_WAIT=1`: the records [`HostHeap::mirror_copied_page`]
+    /// set waiting [`copied_grace`] or more frames before now, each once:
+    /// left to its draws if a draw read its slot through a table since,
+    /// else mirrored from what the slot's record is now (title slot `i` at
+    /// `start + i * step`).
+    ///
+    /// Fork #827's case stands open for those frames: until then the slot
+    /// shows the view it had to a shader picking it by index.
+    pub(crate) fn mirror_waited(&self, start: u64, step: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let frame = crate::frame::current();
+        let mut slots = Vec::new();
+        {
+            let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+            while waiting.front().is_some_and(|(found, _)| found + copied_grace() <= frame) {
+                slots.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
+            }
+        }
+        if slots.is_empty() {
+            return;
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        let tables = sync_tables();
+        for index in slots {
+            if !tables && self.tabled_lately(index, frame) {
+                COPIED_WAIT[2].fetch_add(1, Relaxed);
+                continue;
+            }
+            COPIED_WAIT[1].fetch_add(1, Relaxed);
+            let (_, remade) = self.mirror_counted(index, start + u64::from(index) * step, false, false, true);
+            COPIED_REMADE[usize::from(!remade)].fetch_add(1, Relaxed);
+        }
     }
 
     /// Whether skipped tables' slots are marked: for the sweep
@@ -2640,6 +2707,31 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether new buffer and placed-texture records the title copies into its
+/// heap as bytes wait [`copied_grace`] frames before they are mirrored, and
+/// records that are no view, in slots made of none, are not mirrored
+/// (`VICTORY_COPIED_WAIT=1`; off by default). After fork avatarmanz
+/// (VIctory-7900XTX), whose deferral of copied records took its frame from
+/// 280 to 124 ms: the title builds each draw's tables by copying records,
+/// and the draw makes what it reads of them anyway.
+pub(crate) fn copied_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPIED_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Frames (as `crate::frame::current` counts them) a record waits with
+/// [`copied_wait`]: `VICTORY_COPIED_GRACE=<n>`, 4 by default (fork
+/// avatarmanz's).
+fn copied_grace() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_COPIED_GRACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4))
+}
+
+/// Since the last frame line, with [`copied_wait`]: records set waiting,
+/// mirrored after their wait, left to draws that read them through a
+/// table meanwhile, and records that were no view looked at under `made`.
+pub(crate) static COPIED_WAIT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// `VICTORY_TABLED_CENSUS=0`: the skipped tables' slots are not marked
 /// nor counted ([`HostHeap::census_pending`]; on by default, without
