@@ -171,6 +171,11 @@ impl<C: Clone> Picked<C> {
         due
     }
 
+    /// The record slot `slot` was kept with (not an orphan's).
+    pub(crate) fn kept_record(&self, slot: u32) -> Option<Record> {
+        self.slots.get(&slot).map(|s| s.record)
+    }
+
     fn record_of(&self, slot: u32) -> Option<Record> {
         self.slots
             .get(&slot)

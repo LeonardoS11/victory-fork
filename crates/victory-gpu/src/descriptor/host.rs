@@ -93,6 +93,11 @@ pub(crate) struct HostHeap {
     defer: std::sync::atomic::AtomicBool,
     /// The frame of the last [`HostHeap::sweep_pending`] (plus one).
     swept: std::sync::atomic::AtomicU64,
+    /// The frame of the last [`HostHeap::census_pending`] (plus one).
+    censused: std::sync::atomic::AtomicU64,
+    /// Per title slot, the frame (plus one) a draw last bound a table
+    /// covering it ([`HostHeap::seen_in_table`]), for the census.
+    table_seen: Vec<std::sync::atomic::AtomicU32>,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -987,6 +992,10 @@ impl HostHeap {
             pending: Pending::new(if sampler { 0 } else { count }),
             defer: std::sync::atomic::AtomicBool::new(tabled_defer()),
             swept: std::sync::atomic::AtomicU64::new(0),
+            censused: std::sync::atomic::AtomicU64::new(0),
+            table_seen: (0..if sampler || !census_on() { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -1883,7 +1892,7 @@ impl HostHeap {
         // by [`HostHeap::sweep_pending`].
         if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if self.defer.load(std::sync::atomic::Ordering::Relaxed) && self.pending.set(index) {
+            if self.marks() && self.pending.set(index) {
                 DEFERRED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return false;
@@ -1998,7 +2007,7 @@ impl HostHeap {
                 // `mirror_copied`.
                 if !tables && self.tabled_lately(index as u32, frame) {
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if self.defer.load(std::sync::atomic::Ordering::Relaxed) && self.pending.set(index as u32) {
+                    if self.marks() && self.pending.set(index as u32) {
                         DEFERRED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     continue;
@@ -2035,6 +2044,79 @@ impl HostHeap {
         (looked, due.len() as u64)
     }
 
+    /// Whether skipped tables' slots are marked: for the sweep
+    /// (`VICTORY_TABLED_DEFER=1`) or for the census ([`census_on`]).
+    fn marks(&self) -> bool {
+        self.defer.load(std::sync::atomic::Ordering::Relaxed) || census_on()
+    }
+
+    /// Whether slots are cleared of their mark by the draws that bind a
+    /// table over them (`VICTORY_TABLED_DEFER=1` only: the census keeps
+    /// them, and tells by [`HostHeap::seen_in_table`]).
+    pub(crate) fn defers(&self) -> bool {
+        self.defer.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A draw bound a table over title slot `index` (for the census).
+    pub(crate) fn seen_in_table(&self, index: u32) {
+        if let Some(seen) = self.table_seen.get(index as usize) {
+            let now = (crate::frame::current() as u32).wrapping_add(1);
+            if seen.load(std::sync::atomic::Ordering::Relaxed) != now {
+                seen.store(now, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Once per frame without `VICTORY_TABLED_DEFER`: counts the marked
+    /// slots (left stale by the skip of tables' slots), those no table
+    /// covered for 2 frames or more (fork #827's case: read, if at all,
+    /// by a shader picking by index or past a table's named entries), and
+    /// of those the ones holding a buffer view (the pass for shaders that
+    /// pick buffers by index serves those). Nothing is made.
+    pub(crate) fn census_pending(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.defers() || !census_on() || self.pending.is_empty() {
+            return;
+        }
+        let frame = crate::frame::current();
+        if self.censused.swap(frame + 1, Relaxed) == frame + 1 {
+            return;
+        }
+        let marked = self.pending.marked();
+        let now = (frame as u32).wrapping_add(1);
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut outside = 0u64;
+        let mut picked = 0u64;
+        for &index in &marked {
+            let seen = self.table_seen.get(index as usize).map_or(0, |s| s.load(Relaxed));
+            if seen == 0 || now.wrapping_sub(seen) >= 2 {
+                outside += 1;
+                if buffers.contains(&index) {
+                    picked += 1;
+                }
+            }
+        }
+        drop(buffers);
+        for (count, n) in CENSUS.iter().zip([marked.len() as u64, outside, picked, 1]) {
+            count.fetch_add(n, Relaxed);
+        }
+    }
+
+    /// Whether title slot `index` was made from `record` (a view tag, the
+    /// same words, and their view still the table's): the pass over buffer
+    /// views a shader picks by index has nothing to do for it.
+    pub(crate) fn made_from(&self, index: u32, record: [u32; 3]) -> bool {
+        let [tag, i, generation] = record;
+        tag == VIEW_TAG
+            && self
+                .made
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index as usize)
+                .is_some_and(|&key| key == u64::from(generation) << 32 | u64::from(i))
+            && super::record_alive(i, generation)
+    }
+
     /// Whether slot `index` is pending ([`HostHeap::pending`]); a draw
     /// about to make it from its table calls this to count it.
     pub(crate) fn take_pending(&self, index: u32) -> bool {
@@ -2066,7 +2148,8 @@ impl HostHeap {
     /// [`HostHeap::sweep_pending`] in frame `frame`.
     pub(crate) fn sweep_pending_at(&self, start: u64, step: u64, limit: u32, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.pending.is_empty() || self.swept.swap(frame + 1, Relaxed) == frame + 1 {
+        // Marked for the census alone: nothing is made.
+        if !self.defers() || self.pending.is_empty() || self.swept.swap(frame + 1, Relaxed) == frame + 1 {
             return;
         }
         let due = self.pending.due();
@@ -2484,6 +2567,19 @@ fn sync_tables() -> bool {
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `VICTORY_TABLED_CENSUS=0`: the skipped tables' slots are not marked
+/// nor counted ([`HostHeap::census_pending`]; on by default, without
+/// `VICTORY_TABLED_DEFER`).
+pub(crate) fn census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_CENSUS").is_none_or(|v| v != "0"))
+}
+
+/// Summed over the censuses since the last frame line: marked slots, of
+/// them in no table for 2+ frames, of those holding buffer views; and the
+/// censuses taken.
+pub(crate) static CENSUS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// `VICTORY_TABLED_DEFER=1`: [`HostHeap::pending`] (fork #827 without
 /// `VICTORY_TABLED_SKIP_FRAMES`).
 pub(crate) fn tabled_defer() -> bool {
@@ -2558,6 +2654,19 @@ impl Pending {
         self.bits
             .get(index as usize / 64)
             .is_some_and(|w| w.load(std::sync::atomic::Ordering::Relaxed) & 1 << (index % 64) != 0)
+    }
+
+    /// Every slot marked now, in order (the census: nothing cleared).
+    pub(crate) fn marked(&self) -> Vec<u32> {
+        let mut marked = Vec::new();
+        for (w, word) in self.bits.iter().enumerate() {
+            let mut bits = word.load(std::sync::atomic::Ordering::Relaxed);
+            while bits != 0 {
+                marked.push(w as u32 * 64 + bits.trailing_zeros());
+                bits &= bits - 1;
+            }
+        }
+        marked
     }
 
     /// The sweep: clears and returns the slots marked now that were marked
@@ -3473,6 +3582,8 @@ mod tests {
         assert!(p.set(70));
         assert!(p.set(129));
         assert!(!p.set(130), "past the end");
+        assert_eq!(p.marked(), vec![5, 70, 129], "the census clears nothing");
+        assert_eq!(p.marked(), vec![5, 70, 129]);
         assert!(p.due().is_empty(), "the first sweep only sees them");
         assert!(p.take(70), "a draw made 70");
         assert!(!p.take(70));
