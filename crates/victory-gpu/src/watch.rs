@@ -81,6 +81,38 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     kept: false,
 });
 
+/// Since the last frame-rate line (diagnostics): 64 KiB pages the kernel
+/// found written, the 4 KiB pages it named in them, and of the 64 KiB pages
+/// those our own copy-backs had written since they were last found.
+#[cfg(feature = "diagnostics")]
+pub(crate) static FOUND_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Pages our copy-backs wrote into title memory since the kernel last
+/// found them written (diagnostics).
+#[cfg(feature = "diagnostics")]
+static OURS: Mutex<BTreeSet<usize>> = Mutex::new(BTreeSet::new());
+
+/// We wrote title memory `[at, at + len)` with what shaders wrote (a
+/// copy-back): the write watch will find it written (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn ours(at: usize, len: usize) {
+    let mut o = OURS.lock().unwrap_or_else(|e| e.into_inner());
+    o.extend(at / PAGE..at.saturating_add(len).div_ceil(PAGE));
+}
+
+/// Counts the kernel's answer `found` (4 KiB page addresses) into
+/// [`FOUND_STATS`] (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn count_found(found: &[usize]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let pages: BTreeSet<usize> = found.iter().map(|&at| at / PAGE).collect();
+    let mut o = OURS.lock().unwrap_or_else(|e| e.into_inner());
+    let ours = pages.iter().filter(|p| o.remove(p)).count();
+    FOUND_STATS[0].fetch_add(pages.len() as u64, Relaxed);
+    FOUND_STATS[1].fetch_add(found.len() as u64, Relaxed);
+    FOUND_STATS[2].fetch_add(ours as u64, Relaxed);
+}
+
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
 /// call that resets written pages costs 30-70 microseconds whatever the
@@ -303,6 +335,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
+    #[cfg(feature = "diagnostics")]
+    count_found(&j.found[..count]);
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
@@ -397,6 +431,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
+    #[cfg(feature = "diagnostics")]
+    count_found(&j.found[..count]);
     j.asked += 1;
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);

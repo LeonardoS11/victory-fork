@@ -6519,6 +6519,25 @@ impl Meter {
                 p[2],
                 if twins.is_empty() { "none".to_owned() } else { twins.join("; ") },
             );
+            let f: Vec<f64> =
+                crate::watch::FOUND_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            let (distinct, bytes) = crate::shadow::COPIED_PAGES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .map_or((0, 0), |(p, b)| (p.len(), b));
+            let copied = bytes as f64 / frames;
+            tracing::info!(
+                "refreshes per frame: {:.1} MB copied from title memory, over {:.1} MB of distinct 64 KiB pages ({:.1} times \
+                 each); the write watch found {:.0} 64 KiB pages written, with {:.1} of their 16 4 KiB pages each, {:.0} of \
+                 them pages our copy-backs had written since",
+                copied / 1e6,
+                distinct as f64 * crate::watch::PAGE as f64 / 1e6,
+                if distinct > 0 { copied / (distinct as f64 * crate::watch::PAGE as f64) } else { 0.0 },
+                f[0],
+                if f[0] > 0.0 { f[1] / f[0] } else { 0.0 },
+                f[2],
+            );
             let e: Vec<f64> = crate::draw::EI_RUNS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             tracing::info!(
                 "indirect executions per frame: {:.0}; {:.0} of them right after another with the same state (pipeline, \
