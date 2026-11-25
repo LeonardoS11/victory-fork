@@ -6488,11 +6488,13 @@ impl Meter {
             tracing::info!(
                 "indirect executions per frame: {:.0}; {:.0} of them right after another with the same state (pipeline, \
                  signature, heaps, root arguments, vertex and index buffers, nothing drawn or dispatched between), {:.0} of \
-                 those reading the next record of the same buffer; {:.0} runs of such calls (a multi-draw each)",
+                 those reading the next record of the same buffer; {:.0} runs of such calls (a multi-draw each);                  {:.0} indirect draws with no dispatch before them in their list, {:.0} stretches of indirect draws                  between dispatches",
                 e[0],
                 e[1],
                 e[2],
                 e[3],
+                e[4],
+                e[5],
             );
         }
         card_clock_line(frames, ms);

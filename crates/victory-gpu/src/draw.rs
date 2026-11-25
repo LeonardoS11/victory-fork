@@ -241,13 +241,24 @@ pub(crate) struct State {
     /// [`EI_RUNS`]); cleared by any other draw or dispatch.
     #[cfg(feature = "diagnostics")]
     last_indirect: Option<(u64, u64, u32)>,
+    /// Since the list's reset: a dispatch was recorded (it may have written
+    /// arguments later indirect calls read); an indirect draw was recorded
+    /// since the last dispatch (diagnostics, [`EI_RUNS`]).
+    #[cfg(feature = "diagnostics")]
+    dispatched: bool,
+    #[cfg(feature = "diagnostics")]
+    segment_open: bool,
 }
 
 /// Since the last frame-rate line (diagnostics): indirect executions; those
 /// right after another with the same state; of those, the ones reading the
 /// record after the last one's; runs of such calls.
 #[cfg(feature = "diagnostics")]
-pub(crate) static EI_RUNS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Then: indirect draws with no dispatch before them in their list (their
+/// arguments were all written when the list is submitted: a clamp ahead of
+/// the list could take them), and stretches of indirect draws between two
+/// dispatches (a clamp each, ahead of the stretch).
+pub(crate) static EI_RUNS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 impl Drop for State {
     fn drop(&mut self) {
@@ -2048,6 +2059,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         {
             self.last_indirect = None;
+            self.dispatched = true;
+            self.segment_open = false;
         }
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2907,6 +2920,18 @@ impl State {
                 EI_RUNS[3].fetch_add(1, Ordering::Relaxed);
             }
             self.last_indirect = ran.then_some((state, arguments, stride));
+            if ran && kind != 2 {
+                if !self.dispatched {
+                    EI_RUNS[4].fetch_add(1, Ordering::Relaxed);
+                }
+                if !self.segment_open {
+                    EI_RUNS[5].fetch_add(1, Ordering::Relaxed);
+                    self.segment_open = true;
+                }
+            } else if kind == 2 {
+                self.dispatched = true;
+                self.segment_open = false;
+            }
             ran
         }
         #[cfg(not(feature = "diagnostics"))]
