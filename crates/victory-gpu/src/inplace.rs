@@ -304,7 +304,11 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 }
 
 /// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64, pooled: Option<usize>) {
+pub(crate) fn gone(window: bool, bytes: u64, pooled: Option<usize>, section: bool) {
+    if section {
+        SECTION_STATS[0].fetch_sub(1, Ordering::Relaxed);
+        SECTION_STATS[1].fetch_sub(bytes, Ordering::Relaxed);
+    }
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
@@ -319,6 +323,265 @@ pub(crate) fn gone(window: bool, bytes: u64, pooled: Option<usize>) {
             close_section(&mut heaps, k);
         }
     }
+}
+
+/// Whether committed physical-page sections (`SEC_COMMIT`, as `xmem` makes on
+/// Wine/Proton) are opened once via `OpenExistingHeapFromFileMapping` so
+/// contiguous view-memory windows outside buffers are placed directly over the
+/// section with 0 pinned RAM, 0 working-set lock, 0 copies, and 0 guards.
+///
+/// Opt-in (`VICTORY_INPLACE_SECTIONS=1`) and strictly gated on synchronous
+/// completion (`!VICTORY_LATE_WAIT && !VICTORY_RELAY`): because `Shadow::placed`
+/// skips `Shadow::gpu_writes`, allowing section windows while flights fly ahead
+/// would let the CPU observe stale bytes before a shader write lands (#358).
+/// Also requires a one-time CPU<->GPU aliasing round-trip check
+/// (`section_reads && section_writes && section_outlives_views`) to reject
+/// drivers/wrappers (such as stock libdrm/RADV under vkd3d-proton) where
+/// `OpenExistingHeapFromFileMapping` silently falls back to non-aliasing private
+/// memory while still returning `S_OK`.
+pub(crate) fn section_windows_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    level() >= 1
+        && *ON.get_or_init(|| {
+            let asked = std::env::var_os("VICTORY_INPLACE_SECTIONS").is_some_and(|v| v == "1");
+            if !asked {
+                return false;
+            }
+            if crate::host::late() || crate::host::relay() {
+                tracing::warn!(
+                    late = crate::host::late(),
+                    relay = crate::host::relay(),
+                    "VICTORY_INPLACE_SECTIONS=1 refused while VICTORY_LATE_WAIT or VICTORY_RELAY is active: placed windows do not track flight shader writes"
+                );
+                return false;
+            }
+            true
+        })
+}
+
+/// One-time live CPU<->GPU aliasing round-trip verification for
+/// `OpenExistingHeapFromFileMapping` (cached per process). Catches drivers or
+/// Wine/vkd3d-proton backends (e.g. stock libdrm/RADV with `ANONONLY`) where
+/// opening a file mapping returns `S_OK` on a separate non-aliasing buffer.
+fn section_aliasing_verified(device: &ID3D12Device) -> bool {
+    static VERIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERIFIED.get_or_init(|| {
+        let Ok(mut rig) = Rig::new(device) else {
+            tracing::warn!("section-heap aliasing self-test skipped (no test queue): falling back to copies");
+            return false;
+        };
+        let mut p = Probe::default();
+        // SAFETY: `section()` allocates and cleans up its own temporary section, placeholder, and views.
+        unsafe { section(&mut p, &mut rig) };
+        let ok = p.section_reads && p.section_writes && p.section_outlives_views;
+        if ok {
+            tracing::info!(
+                section_reads = p.section_reads,
+                section_writes = p.section_writes,
+                section_outlives_views = p.section_outlives_views,
+                "verified OpenExistingHeapFromFileMapping CPU<->GPU aliasing for VICTORY_INPLACE_SECTIONS=1"
+            );
+        } else {
+            tracing::warn!(
+                section_reads = p.section_reads,
+                section_writes = p.section_writes,
+                section_outlives_views = p.section_outlives_views,
+                "OpenExistingHeapFromFileMapping failed CPU<->GPU aliasing check: disabling VICTORY_INPLACE_SECTIONS"
+            );
+        }
+        ok
+    })
+}
+
+/// Section-heap in-place windows: [0] live count, [1] live bytes, [2] total
+/// opened, [3] section heaps cached, [4] open/place refusals.
+static SECTION_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Cached `ID3D12Heap` per committed section handle (`OpenExistingHeapFromFileMapping`).
+/// `None` caches a driver refusal so we never retry a refused section.
+static SECTION_WINDOW_HEAPS: Mutex<Option<std::collections::HashMap<usize, Option<ID3D12Heap>>>> = Mutex::new(None);
+
+/// Finds the maximal contiguous run of mapped views inside `[cell, cell_end)`
+/// covering `[address, end)` that all belong to one `SEC_COMMIT` section with
+/// contiguous section offsets. Returns `(run_start, run_len, section, run_offset)`
+/// (all 64 KiB aligned). For unsized root views (`unsized_ask`), requires the
+/// contiguous run to reach `cell_end` so later mappings in the same cell can
+/// never be silently truncated by a cached partial window.
+fn find_section_run(
+    v: &Views,
+    address: usize,
+    end: usize,
+    cell: usize,
+    cell_end: usize,
+    unsized_ask: bool,
+) -> Option<(usize, usize, usize, u64)> {
+    let (&base, &(bytes, section, offset)) = v
+        .views
+        .range(..=address)
+        .next_back()
+        .filter(|&(&b, &(len, _, _))| b.saturating_add(len) > address)?;
+    let (section_bytes, committed) = v
+        .sections
+        .iter()
+        .find(|s| s.0 == section)
+        .map(|s| (s.1, s.2))?;
+    if !committed {
+        return None;
+    }
+    let mut run_start = base;
+    let mut run_end = base.saturating_add(bytes);
+    let mut run_offset = offset;
+    while run_start > cell {
+        let Some((&pb, &(plen, ps, poff))) = v.views.range(..run_start).next_back() else {
+            break;
+        };
+        if ps == section
+            && pb.saturating_add(plen) == run_start
+            && poff.saturating_add(plen as u64) == run_offset
+        {
+            run_start = pb;
+            run_offset = poff;
+        } else {
+            break;
+        }
+    }
+    while run_end < cell_end {
+        let Some(&(nlen, ns, noff)) = v.views.get(&run_end) else {
+            break;
+        };
+        if ns == section && noff == run_offset.saturating_add((run_end - run_start) as u64) {
+            run_end = run_end.saturating_add(nlen);
+        } else {
+            break;
+        }
+    }
+    if run_start < cell {
+        let skip = cell - run_start;
+        run_start = cell;
+        run_offset = run_offset.saturating_add(skip as u64);
+    }
+    if run_end > cell_end {
+        run_end = cell_end;
+    }
+    let aligned_start = run_start.next_multiple_of(K64);
+    if aligned_start > run_start {
+        run_offset = run_offset.saturating_add((aligned_start - run_start) as u64);
+        run_start = aligned_start;
+    }
+    run_end &= !(K64 - 1);
+    if run_start > address || run_end < end || run_start >= run_end {
+        return None;
+    }
+    let run_len = run_end - run_start;
+    if !run_offset.is_multiple_of(K64 as u64)
+        || run_offset.saturating_add(run_len as u64) > section_bytes
+    {
+        return None;
+    }
+    if unsized_ask && run_end != cell_end {
+        return None;
+    }
+    Some((run_start, run_len, section, run_offset))
+}
+
+/// Opens a contiguous view-memory window inside `[cell, cell + cell_len)`
+/// directly on its committed section via `OpenExistingHeapFromFileMapping` +
+/// `CreatePlacedResource`. Zero pinned RAM, zero working-set lock, zero copies.
+/// Window asks that found no committed section run to place over (and
+/// went to a copy), since the start.
+pub(crate) static SECTION_FELL_BACK: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn place_section_window(
+    address: u64,
+    end: u64,
+    cell: u64,
+    cell_len: u64,
+    unsized_ask: bool,
+) -> Option<(Placed, u64, u64)> {
+    if !section_windows_on() || cell_len == 0 {
+        return None;
+    }
+    let (run_start, run_len, section, run_offset) = {
+        let v = views();
+        find_section_run(
+            &v,
+            address as usize,
+            end as usize,
+            cell as usize,
+            cell.saturating_add(cell_len) as usize,
+            unsized_ask,
+        )
+        .or_else(|| {
+            SECTION_FELL_BACK.fetch_add(1, Ordering::Relaxed);
+            None
+        })?
+    };
+    let host = crate::host::host()?;
+    if !section_aliasing_verified(&host.device) {
+        return None;
+    }
+    let heap = {
+        let mut heaps = SECTION_WINDOW_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = heaps.get_or_insert_with(Default::default);
+        if let Some(cached) = map.get(&section) {
+            cached.clone()?
+        } else {
+            match open(&host.device, From::Section(section)) {
+                Ok(h) => {
+                    SECTION_STATS[3].fetch_add(1, Ordering::Relaxed);
+                    let mb = views()
+                        .sections
+                        .iter()
+                        .find(|s| s.0 == section)
+                        .map_or(0, |s| s.1 >> 20);
+                    tracing::info!(
+                        section = format_args!("{section:#x}"),
+                        mb,
+                        "opened committed section as zero-copy in-place host heap (VICTORY_INPLACE_SECTIONS=1)"
+                    );
+                    map.insert(section, Some(h.clone()));
+                    h
+                }
+                Err(e) => {
+                    SECTION_STATS[4].fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        section = format_args!("{section:#x}"),
+                        error = %e,
+                        "committed section could not be opened as an in-place host heap: falling back to copies"
+                    );
+                    map.insert(section, None);
+                    return None;
+                }
+            }
+        }
+    };
+    let buffer = match place(&host.device, &heap, run_offset, run_len as u64) {
+        Ok(b) => b,
+        Err(e) => {
+            if SECTION_STATS[4].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(
+                    start = format_args!("{run_start:#x}"),
+                    len = run_len,
+                    offset = format_args!("{run_offset:#x}"),
+                    error = %e,
+                    "CreatePlacedResource on section heap refused: falling back to copy"
+                );
+            }
+            return None;
+        }
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    STATS[1].fetch_add(run_len as u64, Ordering::Relaxed);
+    SECTION_STATS[0].fetch_add(1, Ordering::Relaxed);
+    SECTION_STATS[1].fetch_add(run_len as u64, Ordering::Relaxed);
+    SECTION_STATS[2].fetch_add(1, Ordering::Relaxed);
+    Some((
+        Placed { buffer, heap, gpu, bias: 0, pooled: None },
+        run_start as u64,
+        run_len as u64,
+    ))
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -344,6 +607,20 @@ fn say() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    {
+        let ss: Vec<u64> = SECTION_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        if section_windows_on() || ss[2] > 0 || ss[4] > 0 {
+            tracing::info!(
+                "section-heap windows (VICTORY_INPLACE_SECTIONS=1): {} alive {} MB, {} opened so far, {} sections opened as heaps, {} refused;                  windows that fell back to a copy: {} (no committed section run under them)",
+                ss[0],
+                ss[1] >> 20,
+                ss[2],
+                ss[3],
+                ss[4],
+                SECTION_FELL_BACK.load(Ordering::Relaxed)
+            );
+        }
+    }
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back), {} MB of it in the page pool; turned down: {} view memory \
          or not private memory committed whole, {} refused by the host, {} over VICTORY_INPLACE_MB or VICTORY_INPLACE_POOL_MB; {} let go because their memory changed; \
@@ -1410,6 +1687,41 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_section_run_merges_contiguous_committed_views_and_respects_unsized_tail() {
+        let mut v = Views {
+            views: BTreeMap::new(),
+            pages: BTreeMap::new(),
+            sections: vec![(10, 16 * K64 as u64, true), (20, 16 * K64 as u64, false)],
+        };
+        let cell = 0x7_a000_0000usize;
+        let cell_end = cell + (4 << 20);
+        // Two contiguous views of committed section 10 at [cell+2*K64 .. cell+5*K64)
+        v.views.insert(cell + 2 * K64, (2 * K64, 10, 4 * K64 as u64));
+        v.views.insert(cell + 4 * K64, (K64, 10, 6 * K64 as u64));
+        // A separate non-contiguous view later in the same cell at cell+10*K64
+        v.views.insert(cell + 10 * K64, (K64, 10, 12 * K64 as u64));
+        // Sized ask inside merged run succeeds and spans all 3 contiguous blocks.
+        assert_eq!(
+            find_section_run(&v, cell + 3 * K64 + 16, cell + 4 * K64 + 32, cell, cell_end, false),
+            Some((cell + 2 * K64, 3 * K64, 10, 4 * K64 as u64))
+        );
+        // Unsized ask inside a partial run fails (must reach cell_end so future
+        // mappings in the same cell are never truncated).
+        assert_eq!(find_section_run(&v, cell + 3 * K64, cell + 3 * K64 + 1, cell, cell_end, true), None);
+        assert_eq!(find_section_run(&v, cell + 10 * K64, cell + 10 * K64 + 1, cell, cell_end, true), None);
+        // Unsized ask inside a run that reaches `cell_end` succeeds.
+        let tail_start = cell_end - 2 * K64;
+        v.views.insert(tail_start, (2 * K64, 10, 14 * K64 as u64));
+        assert_eq!(
+            find_section_run(&v, tail_start, tail_start + 1, cell, cell_end, true),
+            Some((tail_start, 2 * K64, 10, 14 * K64 as u64))
+        );
+        // Uncommitted section (SEC_RESERVE) is refused.
+        v.views.insert(cell + 20 * K64, (2 * K64, 20, 0));
+        assert_eq!(find_section_run(&v, cell + 20 * K64, cell + 21 * K64, cell, cell_end, false), None);
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
