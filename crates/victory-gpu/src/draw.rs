@@ -552,6 +552,13 @@ pub(crate) static HEAP_SLOT_COST: [AtomicU64; 5] = [const { AtomicU64::new(0) };
 type ViewCopies = std::collections::HashMap<[u32; 3], (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
 static VIEW_COPIES: std::sync::Mutex<(u64, Option<ViewCopies>)> = std::sync::Mutex::new((u64::MAX, None));
 
+/// Whether the pass over buffer views keeps each view's host copy
+/// ([`VIEW_COPIES`]; `VICTORY_VIEW_COPY_CACHE=0`: looked up every time).
+fn view_copy_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_COPY_CACHE").is_none_or(|v| v != "0"))
+}
+
 /// Of the views the pass over buffer views looked for a host copy of:
 /// found in [`VIEW_COPIES`], and looked up.
 pub(crate) static VIEW_COPY_HITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -1682,7 +1689,7 @@ impl State {
             // view's range alone would find.
             // Its view's copy as found before, while the maps stand.
             let copy = match copies.1.as_mut() {
-                Some(map) if record[0] == crate::descriptor::VIEW_TAG => match map.get(&record) {
+                Some(map) if view_copy_cache() && record[0] == crate::descriptor::VIEW_TAG => match map.get(&record) {
                     Some(found) => {
                         VIEW_COPY_HITS[0].fetch_add(1, Ordering::Relaxed);
                         Some(found.clone())

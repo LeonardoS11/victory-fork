@@ -127,6 +127,11 @@ pub(crate) fn next_start(start: u64, end: u64) -> Option<u64> {
 /// its own: up to where the next texture placed inside it starts
 /// ([`next_start`]), all of them if none does (fork PR #995).
 pub(crate) fn texture_own_bytes(start: u64, len: u64) -> u64 {
+    // `VICTORY_RECHECK_OWN=0`: the whole span, as before #995's fix.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_OWN").is_none_or(|v| v != "0")) {
+        return len;
+    }
     texture_own_len(next_start(start, start.saturating_add(len)), start, len)
 }
 
