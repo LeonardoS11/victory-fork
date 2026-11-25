@@ -1248,6 +1248,27 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
         && o.desc.flags & DEPTH == 0
         && target_format(o.desc.format) == o.desc.format
         && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
+    // Diagnostics: a view placed on a target in a stand-in format (Series S
+    // R9G9B9E5 targets as R11G11B10_FLOAT): its texels' bits are not the
+    // title's, so nothing is copied, and the view reads title memory.
+    #[cfg(feature = "diagnostics")]
+    if !same && target_format(o.desc.format) != o.desc.format {
+        static SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+        let key = (o.desc.format, r.desc.format);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&key) {
+            seen.push(key);
+            tracing::warn!(
+                target_format = o.desc.format,
+                stand_in = target_format(o.desc.format),
+                view_format = r.desc.format,
+                width = r.desc.width,
+                height = r.desc.height,
+                address = format!("{:#x}", r.data() as usize),
+                "a texture placed on a target in a stand-in format: it reads title memory, not what the target holds"
+            );
+        }
+    }
     same.then_some(other)
 }
 
