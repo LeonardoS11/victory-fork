@@ -2480,6 +2480,10 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        // A slot left pending (`VICTORY_TABLED_DEFER=1`) is made here.
+        if host.take_pending(index) {
+            crate::descriptor::host::DEFERRED[1].fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
@@ -2667,6 +2671,9 @@ impl State {
                         {
                             host.texture_slot_tabled(title + k, kind.is_some());
                             if kind.is_some() {
+                                if host.take_pending(title + k) {
+                                    crate::descriptor::host::DEFERRED[1].fetch_add(1, Ordering::Relaxed);
+                                }
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
                             }
                         }

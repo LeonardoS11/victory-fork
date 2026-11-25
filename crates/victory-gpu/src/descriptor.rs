@@ -247,6 +247,9 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        // `VICTORY_TABLED_DEFER=1`: the slots left pending a frame ago
+        // that no draw made since.
+        host.sweep_pending(start, step, mirrored_count);
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
@@ -277,6 +280,15 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    if host::tabled_defer() {
+        let [marked, draws, buffers, textures, other] =
+            [0, 1, 2, 3, 4].map(|i| host::DEFERRED[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "tables' slots copied in as bytes, left pending (VICTORY_TABLED_DEFER=1): per frame {marked:.1} marked, \
+             {draws:.1} made by draws through their tables, made a frame later by the sweep: {buffers:.1} buffer views \
+             (for the buffer pass), {textures:.1} texture views (for the texture pass), {other:.1} other"
+        );
+    }
 }
 
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap
@@ -1337,6 +1349,81 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// Fork #827 in small: a slot a draw's table covered, rewritten by the
+    /// title as bytes, is left to the table's draws by the 240-frame
+    /// window: the pass over buffer views a shader picks by index is never
+    /// told, and reads the old record. With `VICTORY_TABLED_DEFER=1` it is
+    /// pending, and made from the new record by the sweep a frame on (the
+    /// buffer pass is told), or by a draw through its table.
+    #[cfg(windows)]
+    #[test]
+    fn a_tables_slot_rewritten_as_bytes_is_made_again_when_deferred() {
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement { address: 0, size: 0 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        if let Some(host) = title.host() {
+            // Two structured buffer views' records (16-byte elements, 16
+            // and 32 of them), made elsewhere.
+            let mut records = [[0u8; 32]; 2];
+            for (record, elements) in records.iter_mut().zip([16u32, 32]) {
+                let view: [u32; 10] = [0, 1, 0x1688, 0, 0, 0, elements, 16, 0, 0];
+                create_srv(std::ptr::null(), std::ptr::null(), &view, record.as_mut_ptr() as u64);
+            }
+            let start = title.handle(0).expect("slot 0");
+            let mut frame = 1_000_000;
+            // Old record in the slot, the slot in a draw's table, new record copied in.
+            let rewrite = |slot: u32| {
+                let handle = title.handle(slot).expect("slot");
+                let copy = |r: &[u8; 32]| {
+                    // SAFETY: the heap's record of `slot`, 32 bytes.
+                    unsafe { std::ptr::copy_nonoverlapping(r.as_ptr(), handle as *mut u8, 32) }
+                };
+                copy(&records[0]);
+                assert!(host.mirror_copied(slot, handle, &records[0]));
+                assert!(host.buffer_changes().contains(&slot), "the buffer pass is told of the first record");
+                host.texture_slot_tabled(slot, false);
+                copy(&records[1]);
+                assert!(!host.mirror_copied(slot, handle, &records[1]), "left to the table's draws");
+                assert!(!host.buffer_changes().contains(&slot));
+                handle
+            };
+            for (defer, slot) in [(false, 5u32), (true, 6)] {
+                host.set_defer(defer);
+                rewrite(slot);
+                for _ in 0..2 {
+                    host.sweep_pending_at(start, 32, 64, frame);
+                    frame += 1;
+                }
+                let told = host.buffer_changes().contains(&slot);
+                if defer {
+                    assert!(!host.is_pending(slot));
+                    assert!(told, "made from the new record: the buffer pass looks at it");
+                } else {
+                    assert!(!told, "the window alone: the buffer pass never looks, the old record is read");
+                }
+            }
+            // A draw through the table makes it first; the sweep has nothing left.
+            let handle = rewrite(7);
+            assert!(host.is_pending(7));
+            host.sweep_pending_at(start, 32, 64, frame);
+            frame += 1;
+            assert!(host.take_pending(7));
+            host.mirror(7, handle, false);
+            assert!(host.buffer_changes().contains(&7), "made from the new record by the draw");
+            host.sweep_pending_at(start, 32, 64, frame);
+            assert!(!host.buffer_changes().contains(&7), "nothing left for the sweep");
+            host.set_defer(false);
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
     }
 
     /// Verifies `HostHeap::copied` cache invalidation across API writes,
