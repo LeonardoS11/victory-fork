@@ -2831,29 +2831,6 @@ fn late_line(frames: f64) {
             w[WHY_FENCE],
         );
     }
-    #[cfg(feature = "diagnostics")]
-    {
-        let p: Vec<f64> = PRELUDE_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-        let twins = PRELUDE_TWINS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
-        let twins: Vec<String> = twins.iter().map(|(k, n)| format!("{:.1}x {k}", *n as f64 / frames)).collect();
-        tracing::info!(
-            "list preludes per frame: {:.1}, with {:.1} barriers and {:.1} twin copies; twin copies by depth texture: {}",
-            p[0],
-            p[1],
-            p[2],
-            if twins.is_empty() { "none".to_owned() } else { twins.join("; ") },
-        );
-        let e: Vec<f64> = crate::draw::EI_RUNS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-        tracing::info!(
-            "indirect executions per frame: {:.0}; {:.0} of them right after another with the same state (pipeline, \
-             signature, heaps, root arguments, vertex and index buffers, nothing drawn or dispatched between), {:.0} of \
-             those reading the next record of the same buffer; {:.0} runs of such calls (a multi-draw each)",
-            e[0],
-            e[1],
-            e[2],
-            e[3],
-        );
-    }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -4747,10 +4724,10 @@ impl Host {
                 let b = firsts.get(k + 1).copied().unwrap_or(runs_end);
                 if b - a == 2 {
                     let what = match runs[k].prelude_kind.load(Ordering::Relaxed) {
-                        0 => "ours: prelude, barriers only",
-                        1 => "ours: prelude, twin copies into the colour twin",
-                        2 => "ours: prelude, twin copies into the depth texture",
-                        _ => "ours: prelude, twin copies both ways",
+                        0 => "ours: prelude-barriers-only",
+                        1 => "ours: prelude-twin-into-colour",
+                        2 => "ours: prelude-twin-into-depth",
+                        _ => "ours: prelude-twin-both-ways",
                     };
                     g.push((&lists[a..a + 1], None, what));
                     g.push((&lists[a + 1..b], Some(k), ""));
@@ -6495,6 +6472,29 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        #[cfg(feature = "diagnostics")]
+        {
+            let p: Vec<f64> = PRELUDE_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            let twins = PRELUDE_TWINS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+            let twins: Vec<String> = twins.iter().map(|(k, n)| format!("{:.1}x {k}", *n as f64 / frames)).collect();
+            tracing::info!(
+                "list preludes per frame: {:.1}, with {:.1} barriers and {:.1} twin copies; twin copies by depth texture: {}",
+                p[0],
+                p[1],
+                p[2],
+                if twins.is_empty() { "none".to_owned() } else { twins.join("; ") },
+            );
+            let e: Vec<f64> = crate::draw::EI_RUNS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "indirect executions per frame: {:.0}; {:.0} of them right after another with the same state (pipeline, \
+                 signature, heaps, root arguments, vertex and index buffers, nothing drawn or dispatched between), {:.0} of \
+                 those reading the next record of the same buffer; {:.0} runs of such calls (a multi-draw each)",
+                e[0],
+                e[1],
+                e[2],
+                e[3],
+            );
+        }
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         {
