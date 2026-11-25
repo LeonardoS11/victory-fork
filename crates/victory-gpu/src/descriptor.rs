@@ -248,8 +248,9 @@ pub(crate) fn sync_heaps() {
             }
         }
         // `VICTORY_TABLED_DEFER=1`: the slots left pending a frame ago
-        // that no draw made since.
+        // that no draw made since. Otherwise their count, for the line.
         host.sweep_pending(start, step, mirrored_count);
+        host.census_pending();
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
@@ -286,6 +287,19 @@ pub(crate) fn sync_line(frames: f64) {
         tracing::info!(
             "of those mirrored per frame: {remade:.1} made their slot again, {same:.1} named the view it was made \
              from (skipped)"
+        );
+    }
+    if !host::tabled_defer() && host::census_on() {
+        let [stale, outside, picked, frames_seen] =
+            [0, 1, 2, 3].map(|i| host::CENSUS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+        let per = frames_seen.max(1.0);
+        tracing::info!(
+            "tables' slots copied in as bytes and left to their draws, not made since (fork #827's case; \
+             VICTORY_TABLED_CENSUS=0: not counted): {:.0} on average, {:.0} of them in no table for 2+ frames, \
+             {:.0} of those holding buffer views shaders may pick by index",
+            stale / per,
+            outside / per,
+            picked / per
         );
     }
     if host::tabled_defer() {
@@ -976,6 +990,16 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),
         _ => None,
+    }
+}
+
+/// Whether the view a record's words name is still the one in the table
+/// (its entry not freed and reused since); views kept in the words
+/// themselves always are.
+pub(crate) fn record_alive(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        0 => views_read().list.get(i as usize).is_some_and(|(_, current)| *current == generation),
+        _ => true,
     }
 }
 

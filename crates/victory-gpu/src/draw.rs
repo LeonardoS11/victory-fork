@@ -543,7 +543,9 @@ pub(crate) static HEAP_BUFFER_VISITS: [AtomicU64; 2] = [const { AtomicU64::new(0
 pub(crate) static HEAP_SLOT_COST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Of the slots those passes looked at: made again, and found made from
 /// the record they hold (skipped).
-pub(crate) static HEAP_REMADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// (and, last, those skipped before any of that: kept with the record
+/// they hold, made from it).
+pub(crate) static HEAP_REMADE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1604,12 +1606,20 @@ impl State {
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         for (n, &index) in slots.iter().enumerate() {
-            ranges.forget(index);
             let Some(handle) = heap.handle(index) else {
+                ranges.forget(index);
                 continue;
             };
             // Read before the slot is made: a write after it is seen next pass.
             let record = crate::descriptor::record_at(handle);
+            // Kept with this record, and made from it (its view still the
+            // table's): nothing changed, nothing to do (no making, no
+            // looking for its host copy, no keeping it again).
+            if ranges.kept_record(index) == Some(record) && host.made_from(index, record) {
+                HEAP_REMADE[2].fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            ranges.forget(index);
             let entry = crate::descriptor::record_entry(record);
             // One slot in eight is timed, step by step.
             let timed = (n % 8 == 0).then(std::time::Instant::now);
@@ -2679,6 +2689,7 @@ impl State {
             return;
         };
         // A slot left pending (`VICTORY_TABLED_DEFER=1`) is made here.
+        host.seen_in_table(index);
         if host.take_pending(index) {
             crate::descriptor::host::DEFERRED[1].fetch_add(1, Ordering::Relaxed);
         }
@@ -2842,8 +2853,10 @@ impl State {
             // the sweep's to make. (The slot a title stops using through
             // tables is the one fork #827 saw read stale.)
             if let Some(title) = title_first {
+                let defers = host.defers();
                 for k in 0..n {
-                    if host.take_pending(title + k) {
+                    host.seen_in_table(title + k);
+                    if defers && host.take_pending(title + k) {
                         crate::descriptor::host::DEFERRED[1].fetch_add(1, Ordering::Relaxed);
                     }
                 }
