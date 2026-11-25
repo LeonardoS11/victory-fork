@@ -2497,9 +2497,43 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
         .collect()
 }
 
+/// The runs `[first, end)` of pieces of a page written after asking
+/// `since` (`written`: per piece, the asking that last found it written).
+fn pieces_written_since(written: &[u64], since: u64) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut k = 0;
+    while k < written.len() {
+        if written[k] <= since {
+            k += 1;
+            continue;
+        }
+        let first = k;
+        while k < written.len() && written[k] > since {
+            k += 1;
+        }
+        runs.push((first, k));
+    }
+    runs
+}
+
 #[cfg(test)]
 mod stale_tests {
     use super::*;
+
+    /// A page copied at asking 5 takes only the pieces written after it,
+    /// in runs; none if none was.
+    #[test]
+    fn only_pieces_written_since_the_copy_are_taken() {
+        let mut w = [0u64; 16];
+        w[0] = 6;
+        w[1] = 7;
+        w[2] = 5;
+        w[9] = 9;
+        w[15] = 6;
+        assert_eq!(pieces_written_since(&w, 5), vec![(0, 2), (9, 10), (15, 16)]);
+        assert_eq!(pieces_written_since(&w, 9), vec![]);
+        assert_eq!(pieces_written_since(&[3; 16], 0), vec![(0, 16)]);
+    }
 
     #[test]
     fn pages_never_taken_are_stale_written_or_not() {
@@ -3581,11 +3615,21 @@ impl Shadow {
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+        const PIECE: usize = PAGE / crate::watch::PIECES;
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
         let last = (to - 1) / PAGE;
+        // Which 4 KiB pieces of the written pages were written when
+        // (`crate::watch::pieces`): a page copied before takes only those
+        // written since.
+        let pieces = if crate::watch::copy_pieces() && !written.is_empty() {
+            crate::watch::pieces(from / PAGE, last + 1)
+        } else {
+            Vec::new()
+        };
+        let mut pieces = pieces.iter().peekable();
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -3594,7 +3638,42 @@ impl Shadow {
                 }
                 _ => 0,
             };
+            let mut page_pieces = None;
+            while let Some(&&(p, ref w)) = pieces.peek() {
+                if p > page {
+                    break;
+                }
+                pieces.next();
+                if p == page {
+                    page_pieces = Some(*w);
+                }
+            }
             let at = &mut copied[page - base];
+            // Copied before, written since in some of its pieces only:
+            // those pieces, and the page is current.
+            if *at != 0
+                && write > *at
+                && let Some(w) = page_pieces
+                && w.iter().any(|&p| p <= *at)
+            {
+                let since = *at;
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
+                if let Some(first) = run.take() {
+                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                }
+                for (first, end) in pieces_written_since(&w, since) {
+                    let (a, e) = (page * PAGE + first * PIECE, page * PAGE + end * PIECE);
+                    if a.max(from) < e.min(to) {
+                        bytes += self.copy(a.max(from), e.min(to));
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::PiecePages, 1);
+                continue;
+            }
             if *at == 0 || write > *at {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.

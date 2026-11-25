@@ -59,6 +59,12 @@ struct Journal {
     asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// Page number → per 4 KiB piece of it, the asking that last found the
+    /// piece written ([`pieces`]): the kernel tells written pages of 4 KiB,
+    /// and a host copy then takes only the pieces written since it last
+    /// copied the page. A page written whole (guarded view memory, our own
+    /// writes) has every piece at that asking.
+    pieces: BTreeMap<usize, [u64; PIECES]>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -72,14 +78,48 @@ struct Journal {
     kept: bool,
 }
 
+/// 4 KiB pieces in a page.
+pub(crate) const PIECES: usize = PAGE / KERNEL_PAGE;
+
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
+    pieces: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
 });
+
+impl Journal {
+    /// Page `page` written whole at asking `now`.
+    fn page_written(&mut self, page: usize, now: u64) -> Option<u64> {
+        self.pieces.insert(page, [now; PIECES]);
+        self.written.insert(page, now)
+    }
+
+    /// The kernel found the 4 KiB page at `at` written at asking `now`.
+    fn piece_written(&mut self, at: usize, now: u64) {
+        let page = at / PAGE;
+        self.written.insert(page, now);
+        self.pieces.entry(page).or_insert([0; PIECES])[at % PAGE / KERNEL_PAGE] = now;
+    }
+}
+
+/// Whether a host copy takes only the 4 KiB pieces written since it last
+/// copied a page (`VICTORY_COPY_PIECES=0`: the whole 64 KiB page, as
+/// before).
+pub(crate) fn copy_pieces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_PIECES").is_none_or(|v| v != "0"))
+}
+
+/// Per page of `[first, last)` the journal has pieces of: the asking that
+/// last found each 4 KiB piece written, in page order.
+pub(crate) fn pieces(first: usize, last: usize) -> Vec<(usize, [u64; PIECES])> {
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.pieces.range(first..last).map(|(&p, &w)| (p, w)).collect()
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -275,8 +315,10 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
-    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+    // Only the pieces written: a buffer copy of 100 bytes is one piece.
+    let end = at.saturating_add(len);
+    for piece in at / KERNEL_PAGE..end.div_ceil(KERNEL_PAGE) {
+        j.piece_written(piece * KERNEL_PAGE, now);
     }
 }
 
@@ -299,10 +341,10 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = j.page_written(page, now).unwrap_or(0);
     for &other in others {
         if other != page {
-            j.written.insert(other, now);
+            j.page_written(other, now);
         }
     }
     (before, now)
@@ -372,8 +414,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     }
     let now = j.ahead_asked;
     for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+        let at = j.found[k];
+        j.piece_written(at, now);
     }
     true
 }
@@ -553,9 +595,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    for k in 0..count {
+        let at = j.found[k];
+        j.piece_written(at, now);
+    }
+    // Guarded view memory: a write opens 64 KiB at a time.
+    for page in guarded {
+        j.page_written(page, now);
     }
     Some((
         now,

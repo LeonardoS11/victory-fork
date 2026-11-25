@@ -150,6 +150,9 @@ pub(crate) enum C {
     ViewsMadeNs,
     MadeLockTaken,
     MadeLockNs,
+    /// Pages a host copy took only some 4 KiB pieces of
+    /// (`crate::watch::copy_pieces`).
+    PiecePages,
 }
 const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1156,7 +1159,7 @@ pub(crate) fn log(frames: f64) {
             "pages per frame: {:.0} distinct 4 KiB pages copied into host copies ({:.1} MB), {:.0} reported written \
              by the write watch; of one copy in eight, {:.1}% of its 4 KiB pieces differed from what the copy held \
              ({:.0} of {:.0}); {:.0} host descriptors made, {:.2} ms; the made slots' lock found taken {:.0} times, \
-             {:.2} ms waited",
+             {:.2} ms waited; {:.0} pages copied in 4 KiB pieces only (VICTORY_COPY_PIECES=0: whole)",
             v(C::Copied4k),
             v(C::Copied4k) * 4096.0 / 1e6,
             v(C::Written4k),
@@ -1167,6 +1170,7 @@ pub(crate) fn log(frames: f64) {
             v(C::ViewsMadeNs) / 1e6,
             v(C::MadeLockTaken),
             v(C::MadeLockNs) / 1e6,
+            v(C::PiecePages),
         );
     }
     tracing::info!(
