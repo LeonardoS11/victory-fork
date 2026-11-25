@@ -109,6 +109,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         budget.InterlockedMax(4, g.x, was);
         budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        // Bit 3 (diagnostics, `VICTORY_MESH_ZERO=1`): every mesh dispatch
+        // runs no group, to time what is left of it.
+        if ((has_count & 8u) != 0) {
+            g = uint3(0, 0, 0);
+        }
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
@@ -288,6 +293,16 @@ pub(crate) fn bound_ahead(
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
+/// Diagnostics (`VICTORY_MESH_ZERO=1`): the clamp gives every indirect mesh
+/// dispatch zero groups. What the frame keeps of the mesh draws' time is
+/// then the cost of issuing them (the clamp, its two waits, the switch to
+/// compute and back, binding the pipeline), not of their shaders running.
+#[cfg(feature = "diagnostics")]
+fn mesh_zero() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_ZERO").is_some_and(|v| v == "1"))
+}
+
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -356,6 +371,8 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
+    #[cfg(feature = "diagnostics")]
+    let has_count = has_count | if mesh_zero() { 8 } else { 0 };
     let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
