@@ -107,11 +107,12 @@ impl Journal {
 }
 
 /// Whether a host copy takes only the 4 KiB pieces written since it last
-/// copied a page (`VICTORY_COPY_PIECES=0`: the whole 64 KiB page, as
-/// before).
+/// copied a page (`VICTORY_COPY_PIECES=1`; off by default: on Series S it
+/// took 500-665 pages a frame in pieces, view memory dominating, and ran
+/// 127-134 ms a frame against 120 ms without).
 pub(crate) fn copy_pieces() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_PIECES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_PIECES").is_some_and(|v| v == "1"))
 }
 
 /// Per page of `[first, last)` the journal has pieces of: the asking that
