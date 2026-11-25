@@ -3200,6 +3200,27 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        #[cfg(feature = "diagnostics")]
+        if from < to {
+            crate::copystat::pages_copied(from, to);
+            if crate::copystat::sample_copy() {
+                // What of it changes: the title's bytes against the copy's
+                // (write-back memory, cheap to read), 4 KiB at a time.
+                const PIECE: usize = 4096;
+                let mut title = vec![0u8; to - from];
+                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+                // SAFETY: inside the mapping.
+                let held = unsafe { std::slice::from_raw_parts(at, to - from) };
+                let pieces = title.len().div_ceil(PIECE);
+                let changed = (0..pieces)
+                    .filter(|k| {
+                        let (a, e) = (k * PIECE, ((k + 1) * PIECE).min(title.len()));
+                        title[a..e] != held[a..e]
+                    })
+                    .count();
+                crate::copystat::sampled_pieces(pieces as u64, changed as u64);
+            }
+        }
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);

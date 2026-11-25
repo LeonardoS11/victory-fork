@@ -2243,6 +2243,18 @@ impl HostHeap {
         let mut self_changed = false;
         let mut remade = false;
         let result = {
+            #[cfg(feature = "diagnostics")]
+            let mut made = match self.made.try_lock() {
+                Ok(made) => made,
+                Err(_) => {
+                    let waited = std::time::Instant::now();
+                    let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::copystat::add(crate::copystat::C::MadeLockTaken, 1);
+                    crate::copystat::add(crate::copystat::C::MadeLockNs, waited.elapsed().as_nanos() as u64);
+                    made
+                }
+            };
+            #[cfg(not(feature = "diagnostics"))]
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
             match view {
@@ -2303,7 +2315,18 @@ impl HostHeap {
                             let kept = if later {
                                 None
                             } else {
-                                make(&view, self.cpu(index))
+                                #[cfg(feature = "diagnostics")]
+                                let began = std::time::Instant::now();
+                                let kept = make(&view, self.cpu(index));
+                                #[cfg(feature = "diagnostics")]
+                                {
+                                    crate::copystat::add(crate::copystat::C::ViewsMade, 1);
+                                    crate::copystat::add(
+                                        crate::copystat::C::ViewsMadeNs,
+                                        began.elapsed().as_nanos() as u64,
+                                    );
+                                }
+                                kept
                             };
                             if kept.is_none() && !self.sampler {
                                 null_for(&view, self.cpu(index));
