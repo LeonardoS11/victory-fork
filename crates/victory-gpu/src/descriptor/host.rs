@@ -1959,7 +1959,11 @@ impl HostHeap {
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due: Vec<(u32, u64, u64)> = Vec::new();
+        // Never raw-copied slots whose record is all zeros: as in
+        // `mirror_copied` (fork #807), one made through the API is made
+        // null, so they are looked at under `made` after the page's walk.
+        let mut zeroed: Vec<(u32, u64, u64)> = Vec::new();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -1984,9 +1988,10 @@ impl HostHeap {
                 let print = record_print(record) | 1;
                 // The record last seen, or a slot never looked at that
                 // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                if *last == print {
                     continue;
                 }
+                let zero = *last == 0 && record.iter().all(|&b| b == 0);
                 // A table's slot lately: left to its draws, and looked at
                 // again next time.
                 // `VICTORY_TABLED_DEFER=1`: marked pending, as in
@@ -1998,11 +2003,29 @@ impl HostHeap {
                     }
                     continue;
                 }
+                if zero {
+                    zeroed.push((index as u32, handle, print));
+                    continue;
+                }
                 *last = print;
-                due.push((index as u32, handle));
+                due.push((index as u32, handle, print));
             }
         }
-        for &(index, handle) in &due {
+        if !zeroed.is_empty() {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            zeroed.retain(|&(index, _, _)| made.get(index as usize).is_some_and(|&key| key != 0));
+            drop(made);
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for &(index, _, print) in &zeroed {
+                if let Some(last) = copied.get_mut(index as usize) {
+                    *last = print;
+                }
+            }
+            drop(copied);
+            due.extend(zeroed);
+            due.sort_unstable_by_key(|d| d.0);
+        }
+        for &(index, handle, _) in &due {
             self.mirror(index, handle, false);
         }
         (looked, due.len() as u64)
