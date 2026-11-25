@@ -786,6 +786,11 @@ pub(crate) struct HostList {
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
+    /// What its last prelude did, for the timing's names (diagnostics):
+    /// bit 0 twin copies into the colour twin, bit 1 into the depth
+    /// texture; 0 barriers only.
+    #[cfg(feature = "diagnostics")]
+    prelude_kind: std::sync::atomic::AtomicU8,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -2035,6 +2040,16 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 /// later one.
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 
+/// Since the last frame-rate line (diagnostics): preludes recorded, their
+/// barriers, their twin copies.
+#[cfg(feature = "diagnostics")]
+static PRELUDE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Since the last frame-rate line (diagnostics): the preludes' twin copies
+/// by the depth texture's size and the way they went.
+#[cfg(feature = "diagnostics")]
+static PRELUDE_TWINS: Mutex<Option<std::collections::BTreeMap<String, u64>>> = Mutex::new(None);
+
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
 /// card with nothing to land, microseconds it waited for fetches of card
@@ -2816,6 +2831,29 @@ fn late_line(frames: f64) {
             w[WHY_FENCE],
         );
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        let p: Vec<f64> = PRELUDE_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let twins = PRELUDE_TWINS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let twins: Vec<String> = twins.iter().map(|(k, n)| format!("{:.1}x {k}", *n as f64 / frames)).collect();
+        tracing::info!(
+            "list preludes per frame: {:.1}, with {:.1} barriers and {:.1} twin copies; twin copies by depth texture: {}",
+            p[0],
+            p[1],
+            p[2],
+            if twins.is_empty() { "none".to_owned() } else { twins.join("; ") },
+        );
+        let e: Vec<f64> = crate::draw::EI_RUNS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "indirect executions per frame: {:.0}; {:.0} of them right after another with the same state (pipeline, \
+             signature, heaps, root arguments, vertex and index buffers, nothing drawn or dispatched between), {:.0} of \
+             those reading the next record of the same buffer; {:.0} runs of such calls (a multi-draw each)",
+            e[0],
+            e[1],
+            e[2],
+            e[3],
+        );
+    }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -3214,6 +3252,8 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
+                #[cfg(feature = "diagnostics")]
+                prelude_kind: std::sync::atomic::AtomicU8::new(0),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -4706,7 +4746,13 @@ impl Host {
             for (k, &a) in firsts.iter().enumerate() {
                 let b = firsts.get(k + 1).copied().unwrap_or(runs_end);
                 if b - a == 2 {
-                    g.push((&lists[a..a + 1], None, "ours: prelude"));
+                    let what = match runs[k].prelude_kind.load(Ordering::Relaxed) {
+                        0 => "ours: prelude, barriers only",
+                        1 => "ours: prelude, twin copies into the colour twin",
+                        2 => "ours: prelude, twin copies into the depth texture",
+                        _ => "ours: prelude, twin copies both ways",
+                    };
+                    g.push((&lists[a..a + 1], None, what));
                     g.push((&lists[a + 1..b], Some(k), ""));
                 } else {
                     g.push((&lists[a..b], Some(k), ""));
@@ -5455,6 +5501,30 @@ impl HostList {
         }));
         if barriers.is_empty() && syncs.is_empty() {
             return None;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let mut kind = 0u8;
+            let mut sizes = PRELUDE_TWINS.lock().unwrap_or_else(|e| e.into_inner());
+            for (depth, _, colour) in &syncs {
+                kind |= if *colour { 1 } else { 2 };
+                // SAFETY: a plain query of a live texture.
+                let d = unsafe { depth.texture.GetDesc() };
+                let key = format!(
+                    "{}x{} mips {} slices {} format {} into the {}",
+                    d.Width,
+                    d.Height,
+                    d.MipLevels,
+                    d.DepthOrArraySize,
+                    d.Format.0,
+                    if *colour { "twin" } else { "depth texture" }
+                );
+                *sizes.get_or_insert_with(std::collections::BTreeMap::new).entry(key).or_default() += 1;
+            }
+            self.prelude_kind.store(kind, Ordering::Relaxed);
+            PRELUDE_STATS[0].fetch_add(1, Ordering::Relaxed);
+            PRELUDE_STATS[1].fetch_add((to_copy.len() + barriers.len()) as u64, Ordering::Relaxed);
+            PRELUDE_STATS[2].fetch_add(syncs.len() as u64, Ordering::Relaxed);
         }
         let Some((allocator, list)) = self
             .prelude

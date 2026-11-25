@@ -25,7 +25,7 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 /// A root argument as the title set it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Hash)]
 enum Root {
     #[default]
     None,
@@ -237,7 +237,17 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// The last indirect execution's state and record (diagnostics,
+    /// [`EI_RUNS`]); cleared by any other draw or dispatch.
+    #[cfg(feature = "diagnostics")]
+    last_indirect: Option<(u64, u64, u32)>,
 }
+
+/// Since the last frame-rate line (diagnostics): indirect executions; those
+/// right after another with the same state; of those, the ones reading the
+/// record after the last one's; runs of such calls.
+#[cfg(feature = "diagnostics")]
+pub(crate) static EI_RUNS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 impl Drop for State {
     fn drop(&mut self) {
@@ -845,6 +855,10 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.last_indirect = None;
+        }
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -2031,6 +2045,10 @@ impl State {
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.last_indirect = None;
+        }
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -2866,6 +2884,51 @@ impl State {
     /// from the buffer's host copy, where earlier dispatches may have
     /// written them. False if it cannot run on the host.
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        (kind, stride, max): (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            let previous = self.last_indirect.take();
+            let state = self.indirect_state(kind, stride, max, count.is_some());
+            let ran = self.execute_indirect_inner(list, (kind, stride, max), arguments, count);
+            EI_RUNS[0].fetch_add(1, Ordering::Relaxed);
+            if let Some((s, at, step)) = previous
+                && s == state
+            {
+                EI_RUNS[1].fetch_add(1, Ordering::Relaxed);
+                if arguments == at + u64::from(step) {
+                    EI_RUNS[2].fetch_add(1, Ordering::Relaxed);
+                }
+            } else if ran {
+                EI_RUNS[3].fetch_add(1, Ordering::Relaxed);
+            }
+            self.last_indirect = ran.then_some((state, arguments, stride));
+            ran
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        self.execute_indirect_inner(list, (kind, stride, max), arguments, count)
+    }
+
+    /// What an indirect execution depends on besides its record, hashed
+    /// (diagnostics, [`EI_RUNS`]).
+    #[cfg(feature = "diagnostics")]
+    fn indirect_state(&self, kind: u32, stride: u32, max: u32, counted: bool) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.pipeline, kind, stride, max, counted, self.heaps, self.topology).hash(&mut h);
+        if kind == 2 { &self.compute } else { &self.graphics }.hash(&mut h);
+        if kind != 2 {
+            format!("{:?}{:?}", self.index, self.vertex).hash(&mut h);
+            (&self.targets, self.depth).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    fn execute_indirect_inner(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),
