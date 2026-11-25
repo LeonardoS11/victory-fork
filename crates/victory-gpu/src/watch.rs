@@ -646,6 +646,16 @@ fn failed_asking(start: usize, end: usize) {
     );
 }
 
+/// [`writes`] into a list the caller keeps between askings (the copy
+/// maps' callers, after fork PR #987); `written` holds the pages, the
+/// result is the asking.
+pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, written: &mut Vec<(usize, u64)>) -> Option<u64> {
+    written.clear();
+    let (now, pages) = writes(start, end, guarded)?;
+    written.extend(pages);
+    Some(now)
+}
+
 impl Tracked {
     /// Takes changed pages of `[from, to)`, cut to the tracked range. A
     /// partial page stays changed so a later take can read its other bytes.
