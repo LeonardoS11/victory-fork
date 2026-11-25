@@ -85,6 +85,14 @@ pub(crate) struct HostHeap {
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
     tabled: Vec<std::sync::atomic::AtomicU32>,
+    /// `VICTORY_TABLED_DEFER=1`: slots whose record the title copied in as
+    /// bytes while they were a table's lately, not mirrored then
+    /// ([`HostHeap::mirror_copied`]) and not made since ([`Pending`]).
+    pending: Pending,
+    /// Whether this heap defers those slots ([`tabled_defer`]; tests set it).
+    defer: std::sync::atomic::AtomicBool,
+    /// The frame of the last [`HostHeap::sweep_pending`] (plus one).
+    swept: std::sync::atomic::AtomicU64,
     /// The title memory each placed texture view of this heap describes,
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
@@ -976,6 +984,9 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            pending: Pending::new(if sampler { 0 } else { count }),
+            defer: std::sync::atomic::AtomicBool::new(tabled_defer()),
+            swept: std::sync::atomic::AtomicU64::new(0),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -1860,8 +1871,21 @@ impl HostHeap {
         // made and brought up to date once more by the pass over buffer
         // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
         // are mirrored too, as in run 200.
+        //
+        // Left, the slot shows the record from before the copy to anything
+        // that reads it other than through a table that makes its own view:
+        // a shader that picks it by index, a table read in place past the
+        // entries the shader names. Fork #827: a slot the title stopped
+        // using through a table, written by bytes, read as it was
+        // (0xc0000005 in the title). `VICTORY_TABLED_DEFER=1`: such a slot
+        // is marked pending; a draw that reads it through a table makes it
+        // (and the mark goes), and one no draw made within a frame is made
+        // by [`HostHeap::sweep_pending`].
         if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
             COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.defer.load(std::sync::atomic::Ordering::Relaxed) && self.pending.set(index) {
+                DEFERRED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return false;
         }
         let n = record.len();
@@ -1965,8 +1989,13 @@ impl HostHeap {
                 }
                 // A table's slot lately: left to its draws, and looked at
                 // again next time.
+                // `VICTORY_TABLED_DEFER=1`: marked pending, as in
+                // `mirror_copied`.
                 if !tables && self.tabled_lately(index as u32, frame) {
                     COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if self.defer.load(std::sync::atomic::Ordering::Relaxed) && self.pending.set(index as u32) {
+                        DEFERRED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     continue;
                 }
                 *last = print;
@@ -1977,6 +2006,67 @@ impl HostHeap {
             self.mirror(index, handle, false);
         }
         (looked, due.len() as u64)
+    }
+
+    /// Whether slot `index` is pending ([`HostHeap::pending`]); a draw
+    /// about to make it from its table calls this to count it.
+    pub(crate) fn take_pending(&self, index: u32) -> bool {
+        self.pending.take(index)
+    }
+
+    /// Whether slot `index` is pending (tests).
+    #[cfg(test)]
+    pub(crate) fn is_pending(&self, index: u32) -> bool {
+        self.pending.is_set(index)
+    }
+
+    /// Turns [`HostHeap::pending`] on or off for this heap (tests).
+    #[cfg(test)]
+    pub(crate) fn set_defer(&self, on: bool) {
+        self.defer.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Once per frame: makes the pending slots no draw made since the last
+    /// sweep, from the records at `start + index * step` (read through the
+    /// kernel first: the title unmaps heap pages). Slots at or past `limit`
+    /// are dropped. A buffer view made here is left for the pass over
+    /// buffer views (it is marked written, as a mirrored one is); a texture
+    /// view goes into the queue of textures picked by index.
+    pub(crate) fn sweep_pending(&self, start: u64, step: u64, limit: u32) {
+        self.sweep_pending_at(start, step, limit, crate::frame::current());
+    }
+
+    /// [`HostHeap::sweep_pending`] in frame `frame`.
+    pub(crate) fn sweep_pending_at(&self, start: u64, step: u64, limit: u32, frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.pending.is_empty() || self.swept.swap(frame + 1, Relaxed) == frame + 1 {
+            return;
+        }
+        let due = self.pending.due();
+        if due.is_empty() {
+            return;
+        }
+        let mut record = vec![0u8; step as usize];
+        for index in due {
+            if index >= limit.min(self.count) {
+                continue;
+            }
+            let handle = start + u64::from(index) * step;
+            if !read_record(handle, &mut record) {
+                // Unmapped now: tried again by the next sweep.
+                self.pending.set(index);
+                continue;
+            }
+            if let Some(last) = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+                *last = record_print(&record) | 1;
+            }
+            let part = match self.mirror_inner(index, handle, false, false) {
+                Some(view) if view.is_buffer() => 2,
+                Some(view) if is_texture_view(&view) => 3,
+                _ => 4,
+            };
+            DEFERRED[part].fetch_add(1, Relaxed);
+        }
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2011,6 +2101,8 @@ impl HostHeap {
             }
             return None;
         }
+        // Made from the record there now: no longer pending.
+        self.pending.take(index);
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
@@ -2340,6 +2432,103 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_TABLED_DEFER=1`: [`HostHeap::pending`] (fork #827 without
+/// `VICTORY_TABLED_SKIP_FRAMES`).
+pub(crate) fn tabled_defer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_DEFER").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line, of [`HostHeap::pending`]: slots marked;
+/// made by draws through their tables; made by the sweep as buffer views
+/// (then the buffer pass's), as texture views (then the texture pass's),
+/// as anything else.
+pub(crate) static DEFERRED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// A record of `dst.len()` bytes at `handle`, read through the kernel.
+fn read_record(handle: u64, dst: &mut [u8]) -> bool {
+    crate::host::read_into(handle as *const u8, dst)
+}
+
+/// One bit per title slot ([`HostHeap::pending`]), and the bits a sweep
+/// found set ([`Pending::due`]): a slot is due when it is still set at
+/// the sweep after the one that first saw it, so a draw in between that
+/// makes it (and clears it) leaves the sweep nothing to do.
+pub(crate) struct Pending {
+    count: u32,
+    bits: Vec<std::sync::atomic::AtomicU64>,
+    seen: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl Pending {
+    pub(crate) fn new(count: u32) -> Self {
+        let words = count.div_ceil(64) as usize;
+        let zeros = || (0..words).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        Self { count, bits: zeros(), seen: zeros() }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bits.is_empty()
+    }
+
+    /// Marks `index`; true if it was not marked.
+    pub(crate) fn set(&self, index: u32) -> bool {
+        if index >= self.count {
+            return false;
+        }
+        let Some(word) = self.bits.get(index as usize / 64) else {
+            return false;
+        };
+        let bit = 1u64 << (index % 64);
+        word.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0
+    }
+
+    /// Clears `index`; true if it was marked.
+    pub(crate) fn take(&self, index: u32) -> bool {
+        let Some(word) = self.bits.get(index as usize / 64) else {
+            return false;
+        };
+        let bit = 1u64 << (index % 64);
+        // A load first: most slots made are not pending, and a plain read
+        // keeps the cache line shared.
+        word.load(std::sync::atomic::Ordering::Relaxed) & bit != 0
+            && word.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed) & bit != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_set(&self, index: u32) -> bool {
+        self.bits
+            .get(index as usize / 64)
+            .is_some_and(|w| w.load(std::sync::atomic::Ordering::Relaxed) & 1 << (index % 64) != 0)
+    }
+
+    /// The sweep: clears and returns the slots marked now that were marked
+    /// at the last sweep too; the others marked now are seen for the next.
+    pub(crate) fn due(&self) -> Vec<u32> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut due = Vec::new();
+        for (w, (word, seen)) in self.bits.iter().zip(&self.seen).enumerate() {
+            let now = word.load(Relaxed);
+            let old = seen.load(Relaxed);
+            if now == 0 && old == 0 {
+                continue;
+            }
+            let ripe = now & old;
+            seen.store(now & !ripe, Relaxed);
+            if ripe == 0 {
+                continue;
+            }
+            // Only the bits still set: a draw may clear one meanwhile.
+            let mut bits = word.fetch_and(!ripe, Relaxed) & ripe;
+            while bits != 0 {
+                due.push(w as u32 * 64 + bits.trailing_zeros());
+                bits &= bits - 1;
+            }
+        }
+        due
+    }
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -3215,6 +3404,28 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`Pending`]: a slot falls due at the second sweep that finds it
+    /// marked, not if a draw made it in between; slots past the end are
+    /// never marked.
+    #[test]
+    fn pending_slots_fall_due_at_the_second_sweep_unless_made_between() {
+        let p = Pending::new(130);
+        assert!(p.set(5));
+        assert!(!p.set(5), "marked once");
+        assert!(p.set(70));
+        assert!(p.set(129));
+        assert!(!p.set(130), "past the end");
+        assert!(p.due().is_empty(), "the first sweep only sees them");
+        assert!(p.take(70), "a draw made 70");
+        assert!(!p.take(70));
+        assert!(p.set(64), "marked after the first sweep");
+        assert_eq!(p.due(), vec![5, 129]);
+        assert!(!p.is_set(5) && !p.is_set(129) && p.is_set(64));
+        assert_eq!(p.due(), vec![64]);
+        assert!(p.due().is_empty());
+        assert!(Pending::new(0).is_empty());
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
