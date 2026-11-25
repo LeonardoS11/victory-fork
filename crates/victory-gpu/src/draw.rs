@@ -2572,7 +2572,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.draw_ends_window();
         if self.may_store() {
             list.gather_close();
         }
@@ -2987,7 +2987,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.draw_ends_window();
         if self.may_store() {
             list.gather_close();
         }
@@ -3095,7 +3095,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
+        self.draw_ends_window();
         if self.may_store() {
             list.gather_close();
         }
@@ -3127,6 +3127,26 @@ impl State {
 }
 
 impl State {
+    /// A direct draw ends the window ([`windows`]). With
+    /// `VICTORY_INDIRECT_WINDOW_DRAWS=1` (off by default) only a draw whose
+    /// shaders can store to buffers does: such a draw may write the
+    /// arguments the window holds clamped, and no other draw touches them
+    /// or the list's scratch buffer.
+    fn draw_ends_window(&mut self) {
+        static OVER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.window.is_none() {
+            return;
+        }
+        let over = *OVER.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW_DRAWS").is_some_and(|v| v == "1"));
+        let stores = || {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+                .is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
+        };
+        if !over || stores() {
+            self.window = None;
+        }
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
