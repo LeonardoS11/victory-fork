@@ -365,12 +365,96 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::pages_written(&j.found[..count]);
+        probe_note(first * PAGE, (last - first) * PAGE, started.elapsed().as_micros() as u64);
+    }
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
     }
     true
+}
+
+/// Diagnostics: every [`PROBE_EVERY`] frames, the write-watch askings of
+/// one frame are noted (range, microseconds), and at its present one
+/// asking per reservation over the span they covered is timed, without
+/// the reset flag (nothing the journal knows changes): is one big call
+/// cheaper than many?
+#[cfg(feature = "diagnostics")]
+const PROBE_EVERY: u64 = 120;
+
+#[cfg(feature = "diagnostics")]
+static PROBE: Mutex<(bool, u64, Vec<(usize, usize, u64)>)> = Mutex::new((false, 0, Vec::new()));
+
+/// A successful kernel asking of `len` bytes at `start` took `us`.
+#[cfg(feature = "diagnostics")]
+fn probe_note(start: usize, len: usize, us: u64) {
+    let mut p = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    if p.0 {
+        p.2.push((start, len, us));
+    }
+}
+
+/// At a present: ends a probed frame (and times the big askings), or
+/// starts one every [`PROBE_EVERY`] frames.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn probe_presented() {
+    #[cfg(feature = "diagnostics")]
+    {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let mut p = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        p.1 += 1;
+        if !p.0 {
+            p.0 = p.1.is_multiple_of(PROBE_EVERY);
+            return;
+        }
+        p.0 = false;
+        let asked = std::mem::take(&mut p.2);
+        drop(p);
+        if asked.is_empty() {
+            return;
+        }
+        // The askings' span per reservation.
+        let mut spans: std::collections::BTreeMap<usize, (usize, usize)> = std::collections::BTreeMap::new();
+        for &(start, len, _) in &asked {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: a query of our own process's memory.
+            if unsafe { VirtualQuery(start as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+                continue;
+            }
+            let span = spans.entry(info.AllocationBase as usize).or_insert((start, start + len));
+            span.0 = span.0.min(start);
+            span.1 = span.1.max(start + len);
+        }
+        let mut found: Vec<usize> = Vec::new();
+        let (mut big_us, mut bytes, mut failed) = (0u64, 0usize, 0usize);
+        for &(from, to) in spans.values() {
+            let mut count = (to - from) / KERNEL_PAGE;
+            found.resize(count, 0);
+            let mut granularity = 0;
+            let began = std::time::Instant::now();
+            // SAFETY: the answer buffer holds `count` entries; no reset flag.
+            let bad = unsafe {
+                GetWriteWatch(0, from as *const _, to - from, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+            } != 0;
+            big_us += began.elapsed().as_micros() as u64;
+            bytes += to - from;
+            failed += usize::from(bad);
+        }
+        tracing::info!(
+            "write watch, one frame: {} kernel askings took {:.2} ms; one asking per reservation over the span they \
+             covered ({} reservations, {} MB, {} failed) took {:.2} ms",
+            asked.len(),
+            asked.iter().map(|a| a.2).sum::<u64>() as f64 / 1e3,
+            spans.len(),
+            bytes >> 20,
+            failed,
+            big_us as f64 / 1e3
+        );
+    }
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -462,6 +546,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
+        if !failed {
+            crate::copystat::pages_written(&j.found[..count]);
+            probe_note(first * PAGE, (last - first) * PAGE, started.elapsed().as_micros() as u64);
+        }
     }
     j.asked += 1;
     let now = j.asked;

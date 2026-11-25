@@ -133,8 +133,25 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Distinct 4 KiB pages of title memory copied into host copies in a
+    /// frame, and reported written by the kernel's write watch in a frame
+    /// (summed over frames; [`pages_copied`], [`pages_written`]).
+    Copied4k,
+    Written4k,
+    /// Of one copy into a host copy in eight: 4 KiB pieces copied, and of
+    /// them those whose bytes differed from what the copy held
+    /// ([`sampled_pieces`]).
+    SampledPieces,
+    SampledChanged,
+    /// Host descriptors made (`Create*View`) for title slots, and their
+    /// nanoseconds; the lock of the made slots found taken, and the
+    /// nanoseconds waited for it.
+    ViewsMade,
+    ViewsMadeNs,
+    MadeLockTaken,
+    MadeLockNs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1056,9 +1073,46 @@ pub(crate) fn present_begins() {
     add(C::TailUs, now_us().saturating_sub(SUBMITTED_AT.load(Relaxed)));
 }
 
+/// Distinct 4 KiB pages of this frame: copied into host copies, and
+/// reported written by the write watch.
+static PAGES: Mutex<Option<(std::collections::HashSet<usize>, std::collections::HashSet<usize>)>> = Mutex::new(None);
+
+/// Title memory `[from, to)` was copied into a host copy.
+pub(crate) fn pages_copied(from: usize, to: usize) {
+    let mut p = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    let (copied, _) = p.get_or_insert_with(Default::default);
+    copied.extend(from / 4096..to.div_ceil(4096));
+}
+
+/// The write watch reported these pages (addresses) written.
+pub(crate) fn pages_written(pages: &[usize]) {
+    let mut p = PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, written) = p.get_or_insert_with(Default::default);
+    written.extend(pages.iter().map(|a| a / 4096));
+}
+
+/// Of a sampled copy: `pieces` 4 KiB pieces, `changed` of them differed.
+pub(crate) fn sampled_pieces(pieces: u64, changed: u64) {
+    add(C::SampledPieces, pieces);
+    add(C::SampledChanged, changed);
+}
+
+/// Whether this copy into a host copy is one of the eight sampled.
+pub(crate) fn sample_copy() -> bool {
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Relaxed).is_multiple_of(8)
+}
+
 /// A frame was presented.
 pub(crate) fn presented() {
     add(C::Frames, 1);
+    if let Some((copied, written)) = PAGES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        add(C::Copied4k, copied.len() as u64);
+        add(C::Written4k, written.len() as u64);
+        copied.clear();
+        written.clear();
+    }
+    crate::watch::probe_presented();
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
     SUBMITTED_SINCE.store(false, Relaxed);
@@ -1095,6 +1149,26 @@ pub(crate) fn log(frames: f64) {
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
+    {
+        let v = |k: C| c[k as usize];
+        let (pieces, changed) = (v(C::SampledPieces), v(C::SampledChanged));
+        tracing::info!(
+            "pages per frame: {:.0} distinct 4 KiB pages copied into host copies ({:.1} MB), {:.0} reported written \
+             by the write watch; of one copy in eight, {:.1}% of its 4 KiB pieces differed from what the copy held \
+             ({:.0} of {:.0}); {:.0} host descriptors made, {:.2} ms; the made slots' lock found taken {:.0} times, \
+             {:.2} ms waited",
+            v(C::Copied4k),
+            v(C::Copied4k) * 4096.0 / 1e6,
+            v(C::Written4k),
+            if pieces > 0.0 { changed * 100.0 / pieces } else { 0.0 },
+            changed,
+            pieces,
+            v(C::ViewsMade),
+            v(C::ViewsMadeNs) / 1e6,
+            v(C::MadeLockTaken),
+            v(C::MadeLockNs) / 1e6,
+        );
+    }
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
