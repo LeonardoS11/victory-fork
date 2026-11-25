@@ -541,6 +541,21 @@ pub(crate) static HEAP_BUFFER_VISITS: [AtomicU64; 2] = [const { AtomicU64::new(0
 /// nanoseconds of making it (`mirror`), of finding its host copy
 /// (`buffer_copy`) and of keeping it, and the slots so timed.
 pub(crate) static HEAP_SLOT_COST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// The host copy each buffer view (by its record) was found to read last
+/// ([`crate::descriptor::host::buffer_copy`]), for the pass over buffer
+/// views shaders pick by index: views are kept once in a table, so a record
+/// names one view, and its copy is the same until the copy maps change
+/// ([`crate::shadow::maps_changed`]; then all are forgotten). Most slots a
+/// pass looks at are made already, by a draw or the copy sync, from a view
+/// whose copy was found before; finding it again took a lookup under the
+/// maps' lock (0.35-0.69 us a slot, run Q2).
+type ViewCopies = std::collections::HashMap<[u32; 3], (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+static VIEW_COPIES: std::sync::Mutex<(u64, Option<ViewCopies>)> = std::sync::Mutex::new((u64::MAX, None));
+
+/// Of the views the pass over buffer views looked for a host copy of:
+/// found in [`VIEW_COPIES`], and looked up.
+pub(crate) static VIEW_COPY_HITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Of the slots those passes looked at: made again, and found made from
 /// the record they hold (skipped).
 /// (and, last, those skipped before any of that: kept with the record
@@ -1605,6 +1620,16 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        let mut copies = VIEW_COPIES.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let now = crate::shadow::maps_changed();
+            let (seen, map) = &mut *copies;
+            let map = map.get_or_insert_with(Default::default);
+            if *seen != now || map.len() > 1 << 18 {
+                map.clear();
+                *seen = now;
+            }
+        }
         for (n, &index) in slots.iter().enumerate() {
             let Some(handle) = heap.handle(index) else {
                 ranges.forget(index);
@@ -1655,7 +1680,24 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let copy = crate::descriptor::host::buffer_copy(&view);
+            // Its view's copy as found before, while the maps stand.
+            let copy = match copies.1.as_mut() {
+                Some(map) if record[0] == crate::descriptor::VIEW_TAG => match map.get(&record) {
+                    Some(found) => {
+                        VIEW_COPY_HITS[0].fetch_add(1, Ordering::Relaxed);
+                        Some(found.clone())
+                    }
+                    None => {
+                        VIEW_COPY_HITS[1].fetch_add(1, Ordering::Relaxed);
+                        let found = crate::descriptor::host::buffer_copy(&view);
+                        if let Some(found) = &found {
+                            map.insert(record, found.clone());
+                        }
+                        found
+                    }
+                },
+                _ => crate::descriptor::host::buffer_copy(&view),
+            };
             let timed = step(2, timed);
             let Some((shadow, address, len)) = copy else {
                 // A buffer view whose memory has no host copy (yet): tried

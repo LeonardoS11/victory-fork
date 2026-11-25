@@ -2152,6 +2152,18 @@ fn pieces_written_since(written: &[u64], since: u64) -> Vec<(usize, usize)> {
 mod stale_tests {
     use super::*;
 
+    /// Registering or releasing a title buffer changes the maps a kept
+    /// answer of `find` came from ([`maps_changed`]).
+    #[test]
+    fn the_maps_tell_when_they_change() {
+        let before = maps_changed();
+        register(0x5eed, 0x7000_0000_0000, 0x1000);
+        let registered = maps_changed();
+        assert!(registered > before);
+        unregister(0x5eed, 0x7000_0000_0000);
+        assert!(maps_changed() > registered);
+    }
+
     /// A page copied at asking 5 takes only the pieces written after it,
     /// in runs; none if none was.
     #[test]
@@ -2257,6 +2269,7 @@ pub(crate) fn let_go_idle() {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
+        MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return;
@@ -3648,7 +3661,18 @@ struct Entry {
 static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
     BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bumped whenever the maps [`find`] and [`exact`] answer from may change
+/// (taken for writing): an answer kept from before ([`maps_changed`]) may
+/// no longer be the one they would give.
+static MAPS_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// [`MAPS_CHANGED`] now.
+pub(crate) fn maps_changed() -> u64 {
+    MAPS_CHANGED.load(Ordering::Relaxed)
 }
 
 fn buffers_shared() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
@@ -3691,6 +3715,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
+        MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
@@ -4021,6 +4046,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             return Some(shadow.clone());
         }
     }
+    MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     // Chosen again: another thread may have made one meanwhile.
     let (start, len) = pick(&map);
@@ -4116,6 +4142,8 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
+    // A copy made or let go below.
+    MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
     if map.len() >= MANY {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
