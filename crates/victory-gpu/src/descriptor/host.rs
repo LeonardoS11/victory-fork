@@ -1613,7 +1613,18 @@ impl HostHeap {
     /// Returns the title slots whose placed texture view the write made
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
+    /// [`HostHeap::note_buffer_marked`], marking (tests).
+    #[cfg(test)]
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+        self.note_buffer_marked(index, view, seen, true)
+    }
+
+    /// Records what title slot `index` now holds (see the callers);
+    /// `record_change` false: a buffer slot
+    /// whose membership changed is not handed to the pass over buffer views
+    /// as changed (that pass mirrors it itself: marked, it was looked at
+    /// again every frame; fork PR #1043).
+    fn note_buffer_marked(&self, index: u32, view: Option<&View>, seen: bool, record_change: bool) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
@@ -1691,7 +1702,7 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        if was && record_change {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2054,7 +2065,7 @@ impl HostHeap {
         // would clear it when the slot changes, and the same bytes would be
         // mirrored again at the next write of the page).
         for &(index, handle, _) in &due {
-            let (_, remade) = self.mirror_counted(index, handle, false, false);
+            let (_, remade) = self.mirror_counted(index, handle, false, false, true);
             COPIED_REMADE[usize::from(!remade)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         (looked, due.len() as u64)
@@ -2181,7 +2192,7 @@ impl HostHeap {
             if let Some(last) = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
                 *last = record_print(&record) | 1;
             }
-            let (view, remade) = self.mirror_counted(index, handle, false, false);
+            let (view, remade) = self.mirror_counted(index, handle, false, false, true);
             if !remade {
                 // Made from this record already: nothing to do.
                 DEFERRED[5].fetch_add(1, Relaxed);
@@ -2212,11 +2223,11 @@ impl HostHeap {
     /// Also says whether the slot was made again (false: its record names
     /// the view it was made from, and nothing was done).
     pub(crate) fn mirror_for_pass(&self, index: u32, handle: u64) -> (Option<View>, bool) {
-        self.mirror_counted(index, handle, true, false)
+        self.mirror_counted(index, handle, true, false, false)
     }
 
     fn mirror_inner(&self, index: u32, handle: u64, for_draw: bool, invalidate_copied: bool) -> Option<View> {
-        self.mirror_counted(index, handle, for_draw, invalidate_copied).0
+        self.mirror_counted(index, handle, for_draw, invalidate_copied, true).0
     }
 
     /// Shared implementation of [`HostHeap::mirror`] and
@@ -2229,6 +2240,7 @@ impl HostHeap {
         handle: u64,
         for_draw: bool,
         invalidate_copied: bool,
+        record_change: bool,
     ) -> (Option<View>, bool) {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
@@ -2274,11 +2286,11 @@ impl HostHeap {
                     if current != 0 {
                         self.made.set(index, 0);
                         self.make_null(index);
-                        let _ = self.note_buffer(index, None, false);
+                        let _ = self.note_buffer_marked(index, None, false, record_change);
                         self_changed = true;
                     } else if for_draw {
                         // Left for later and stale since: out of the sets and the stride table.
-                        let _ = self.note_buffer(index, None, false);
+                        let _ = self.note_buffer_marked(index, None, false, record_change);
                     }
                     None
                 }
@@ -2290,7 +2302,9 @@ impl HostHeap {
                         // let go of the host copies they held (below, each under
                         // its own lock, once this slot's is let go).
                         stale.extend(
-                            self.note_buffer(index, Some(&view), for_draw).into_iter().filter(|&s| s != index),
+                            self.note_buffer_marked(index, Some(&view), for_draw, record_change)
+                                .into_iter()
+                                .filter(|&s| s != index),
                         );
                         // A view of a texture object that has no host copy yet waits
                         // for it, as buffer views wait for a draw: the slot is made
@@ -2339,10 +2353,17 @@ impl HostHeap {
                                 }
                                 kept
                             };
-                            if kept.is_none() && !self.sampler {
+                            // A slot never made is null already (`HostHeap::new`
+                            // makes every slot null): making it null again
+                            // cost a view creation for every buffer slot left
+                            // for later (fork PR #1043).
+                            let null_already = later && current == 0;
+                            if kept.is_none() && !self.sampler && !null_already {
                                 null_for(&view, self.cpu(index));
                             }
-                            self.keep(index, kept.flatten());
+                            if !null_already {
+                                self.keep(index, kept.flatten());
+                            }
                             if !later {
                                 self.made.set(index, key);
                             }
