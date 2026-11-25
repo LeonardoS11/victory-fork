@@ -207,6 +207,39 @@ impl GraphicsState {
         )
     }
 
+    /// The blend state as the host takes it: blending off for a target whose
+    /// format the host cannot blend (an integer format), as the console leaves
+    /// it off there. The host refuses the pipeline otherwise (the title's
+    /// windshield wiper mask writes a `uint` third target under one blend
+    /// state for all of them: "The parameter is incorrect" in every run).
+    /// Unchanged when every target blends; the pipeline library's names keep
+    /// the title's state. (From fork PR #995.)
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let enabled = |rt: &D3D12_RENDER_TARGET_BLEND_DESC| rt.BlendEnable.as_bool();
+        let first = blend.RenderTarget[0];
+        let at = |i: usize| if blend.IndependentBlendEnable.as_bool() { blend.RenderTarget[i] } else { first };
+        let refused: Vec<usize> = (0..n)
+            .filter(|&i| enabled(&at(i)))
+            .filter(|&i| {
+                let f = self.targets.RTFormats[i];
+                f != DXGI_FORMAT_UNKNOWN && !blendable(f)
+            })
+            .collect();
+        if refused.is_empty() {
+            return blend;
+        }
+        if !blend.IndependentBlendEnable.as_bool() {
+            blend.IndependentBlendEnable = true.into();
+            blend.RenderTarget = [first; 8];
+        }
+        for i in refused {
+            blend.RenderTarget[i].BlendEnable = false.into();
+        }
+        blend
+    }
+
     fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
         let d = &self.depth;
         D3D12_DEPTH_STENCIL_DESC1 {
@@ -253,6 +286,30 @@ impl GraphicsState {
             })
             .collect()
     }
+}
+
+/// Whether the host GPU blends into render targets of `format` (asked once
+/// per format; a host that does not answer is taken to blend, as before).
+fn blendable(format: DXGI_FORMAT) -> bool {
+    static KNOWN: std::sync::Mutex<Vec<(i32, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, b)) = known.iter().find(|(f, _)| *f == format.0) {
+        return b;
+    }
+    let Some(host) = host() else {
+        return true;
+    };
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: format, ..Default::default() };
+    // SAFETY: a plain query into our own structure.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32)
+    };
+    let b = asked.is_err() || support.Support1.0 & D3D12_FORMAT_SUPPORT1_BLENDABLE.0 != 0;
+    if !b {
+        tracing::info!(format = format.0, "a pipeline blends into a target the host cannot blend: blending off there");
+    }
+    known.push((format.0, b));
+    b
 }
 
 /// One input element: vertex buffer slot, byte offset, format.
@@ -634,7 +691,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -881,7 +938,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -900,7 +957,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
@@ -976,6 +1033,30 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
+    /// A blended float target next to an integer one: the integer target's
+    /// blending is switched off, the float one's kept; with every target
+    /// blendable the title's state is kept as it is (fork PR #995).
+    #[test]
+    fn integer_targets_are_not_blended() {
+        if host().is_none() {
+            return;
+        }
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        let rt = &mut g.blend.RenderTarget[0];
+        rt.BlendEnable = true.into();
+        rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        let blend = g.host_blend();
+        assert!(blend.IndependentBlendEnable.as_bool());
+        assert!(blend.RenderTarget[0].BlendEnable.as_bool(), "the float target still blends");
+        assert!(!blend.RenderTarget[1].BlendEnable.as_bool(), "the integer target does not");
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        assert!(!g.host_blend().IndependentBlendEnable.as_bool());
+    }
+
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 
