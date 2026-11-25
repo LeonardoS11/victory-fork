@@ -280,13 +280,22 @@ pub(crate) fn sync_line(frames: f64) {
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
+    {
+        let [remade, same] =
+            [0, 1].map(|i| host::COPIED_REMADE[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "of those mirrored per frame: {remade:.1} made their slot again, {same:.1} named the view it was made \
+             from (skipped)"
+        );
+    }
     if host::tabled_defer() {
-        let [marked, draws, buffers, textures, other] =
-            [0, 1, 2, 3, 4].map(|i| host::DEFERRED[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        let [marked, draws, buffers, textures, other, same] =
+            [0, 1, 2, 3, 4, 5].map(|i| host::DEFERRED[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
         tracing::info!(
             "tables' slots copied in as bytes, left pending (VICTORY_TABLED_DEFER=1): per frame {marked:.1} marked, \
-             {draws:.1} made by draws through their tables, made a frame later by the sweep: {buffers:.1} buffer views \
-             (for the buffer pass), {textures:.1} texture views (for the texture pass), {other:.1} other"
+             {draws:.1} cleared by draws through their tables, made a frame later by the sweep: {buffers:.1} buffer \
+             views (for the buffer pass), {textures:.1} texture views (for the texture pass), {other:.1} other; \
+             {same:.1} the sweep found made from their record already (skipped)"
         );
     }
 }

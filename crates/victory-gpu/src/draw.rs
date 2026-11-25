@@ -541,6 +541,9 @@ pub(crate) static HEAP_BUFFER_VISITS: [AtomicU64; 2] = [const { AtomicU64::new(0
 /// nanoseconds of making it (`mirror`), of finding its host copy
 /// (`buffer_copy`) and of keeping it, and the slots so timed.
 pub(crate) static HEAP_SLOT_COST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Of the slots those passes looked at: made again, and found made from
+/// the record they hold (skipped).
+pub(crate) static HEAP_REMADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1619,7 +1622,8 @@ impl State {
                     std::time::Instant::now()
                 })
             };
-            let mirrored = host.mirror(index, handle, true);
+            let (mirrored, remade) = host.mirror_for_pass(index, handle);
+            HEAP_REMADE[usize::from(!remade)].fetch_add(1, Ordering::Relaxed);
             let timed = step(1, timed);
             let Some(view) = mirrored else {
                 continue;
@@ -2833,6 +2837,17 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // `VICTORY_TABLED_DEFER=1`: the title's slots of the table are
+            // in use through it (this draw makes its own views of them): not
+            // the sweep's to make. (The slot a title stops using through
+            // tables is the one fork #827 saw read stale.)
+            if let Some(title) = title_first {
+                for k in 0..n {
+                    if host.take_pending(title + k) {
+                        crate::descriptor::host::DEFERRED[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
