@@ -201,12 +201,57 @@ fn sweep() {
     {
         return;
     }
+    if sweep_aside() {
+        // Handed to our thread; this one goes on with the submission.
+        let (lock, wake) = &SWEEP_DUE;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        wake.notify_one();
+        return;
+    }
+    sweep_now();
+}
+
+/// What a sweep lets go of.
+fn sweep_now() {
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
     crate::tiles::give_back_let_go();
 }
+
+/// Whether the once-a-second sweep runs on a thread of ours instead of the
+/// submitting thread (`VICTORY_SWEEP_ASIDE=1`; off by default). The sweep
+/// took some 27 ms a second of the submitting thread (2.8 ms a frame at 9
+/// frames a second, Series S profile), most of it letting go of host
+/// copies of textures (the driver freeing their memory). What it lets go of
+/// is what nothing names: lists in the air keep what they use (`retire`,
+/// `HostList::keep`), and tiles wait their frames (`crate::tiles`).
+fn sweep_aside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SWEEP_ASIDE").is_some_and(|v| v == "1");
+        if on {
+            let _ = std::thread::Builder::new().name("victory-sweep".into()).spawn(|| {
+                let (lock, wake) = &SWEEP_DUE;
+                loop {
+                    {
+                        let mut due = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while !*due {
+                            due = wake.wait(due).unwrap_or_else(|e| e.into_inner());
+                        }
+                        *due = false;
+                    }
+                    sweep_now();
+                }
+            });
+        }
+        on
+    })
+}
+
+/// A sweep is due on [`sweep_aside`]'s thread.
+static SWEEP_DUE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
 /// Drops `object` once every submission running now has finished: at once
 /// if none is.
