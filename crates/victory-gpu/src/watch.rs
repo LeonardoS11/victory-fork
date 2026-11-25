@@ -142,7 +142,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    if pieces.len() < 2 {
+    if pieces.len() < if by_reservation() { 1 } else { 2 } {
         return;
     }
     pieces.sort_unstable();
@@ -167,6 +167,10 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     j.asked += 1;
     j.ahead_asked = j.asked;
     j.ahead.clear();
+    if by_reservation() {
+        ask_by_reservation(j, &pieces);
+        return;
+    }
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -356,6 +360,136 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stamp(page: usize) -> u64 {
     JOURNAL.lock().unwrap_or_else(|e| e.into_inner()).written.get(&page).copied().unwrap_or(0)
+}
+
+/// Whether a submission's asking ahead is one kernel asking per
+/// reservation of title memory, over the span its ranges cover there
+/// (`VICTORY_WATCH_BY_RESERVATION=1`; off by default). Ranges were grouped
+/// by distance alone: a group that crossed two reservations failed and was
+/// asked again by halves, each half a call, and a range alone was asked on
+/// its own (2,244 askings a frame, 11.3 ms, Series S run F3). The bounds of
+/// a reservation are asked of Windows once and kept ([`reservation_of`]);
+/// an asking over kept bounds that fails forgets them.
+fn by_reservation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATCH_BY_RESERVATION").is_some_and(|v| v == "1"))
+}
+
+/// Since the start, with [`by_reservation`]: askings made, askings that
+/// failed (bounds forgotten, the old way then), reservations looked up.
+pub(crate) static BY_RESERVATION: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Write-watched reservations of title memory found so far, in pages:
+/// first page -> end page.
+static RESERVATIONS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Reservations an asking failed on (not write-watched: view memory, or
+/// changed since): first page -> (end page, frame). Their pieces are left
+/// to [`writes`] for [`NOT_WATCHED_FRAMES`] frames, then looked up again.
+static NOT_WATCHED: Mutex<BTreeMap<usize, (usize, u64)>> = Mutex::new(BTreeMap::new());
+const NOT_WATCHED_FRAMES: u64 = 120;
+
+/// Whether page `page` lies in a reservation an asking failed on lately.
+fn not_watched(page: usize) -> bool {
+    let frame = crate::frame::current();
+    let mut map = NOT_WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+    match map.range(..=page).next_back().map(|(&f, &v)| (f, v)) {
+        Some((first, (end, at))) if page < end => {
+            if frame >= at + NOT_WATCHED_FRAMES {
+                map.remove(&first);
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The reservation (pages `[first, end)`) page `page` lies in, from the kept
+/// ones or asked of Windows (its allocation base, then its regions to the
+/// first that is not of it). `None` if it is not reserved memory.
+fn reservation_of(page: usize) -> Option<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    {
+        let kept = RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((&first, &end)) = kept.range(..=page).next_back()
+            && page < end
+        {
+            return Some((first, end));
+        }
+    }
+    BY_RESERVATION[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let query = |at: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        (n != 0).then_some(info)
+    };
+    let info = query(page * PAGE)?;
+    if info.State == MEM_FREE {
+        return None;
+    }
+    let base = info.AllocationBase as usize;
+    let mut at = base;
+    loop {
+        let Some(r) = query(at) else { break };
+        if r.AllocationBase as usize != base || r.State == MEM_FREE {
+            break;
+        }
+        at = (r.BaseAddress as usize).saturating_add(r.RegionSize);
+    }
+    let (first, end) = (base / PAGE, at / PAGE);
+    if first >= end || page < first || page >= end {
+        return None;
+    }
+    RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(first, end);
+    Some((first, end))
+}
+
+/// [`ask_ahead`] by reservation ([`by_reservation`]): `pieces` (page
+/// ranges, sorted) grouped by the reservation they lie in, one asking over
+/// each group's span (at most [`AHEAD_MAX`] pages a call). Pieces in no
+/// reservation, or whose asking fails, are left to [`writes`].
+fn ask_by_reservation(j: &mut Journal, pieces: &[(usize, usize)]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut i = 0;
+    while i < pieces.len() {
+        if not_watched(pieces[i].0) {
+            i += 1;
+            continue;
+        }
+        let Some((r_first, r_end)) = reservation_of(pieces[i].0) else {
+            i += 1;
+            continue;
+        };
+        let first = pieces[i].0;
+        let mut last = pieces[i].1.min(r_end);
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 < r_end && pieces[k].0 >= r_first {
+            last = last.max(pieces[k].1.min(r_end));
+            k += 1;
+        }
+        let mut from = first;
+        while from < last {
+            let to = last.min(from + AHEAD_MAX);
+            BY_RESERVATION[0].fetch_add(1, Relaxed);
+            if ask_kernel(j, from, to) {
+                j.ahead.push((from, to));
+            } else {
+                BY_RESERVATION[1].fetch_add(1, Relaxed);
+                RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(&r_first);
+                NOT_WATCHED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(r_first, (r_end, crate::frame::current()));
+                break;
+            }
+            from = to;
+        }
+        i = k;
+    }
 }
 
 /// One kernel asking for `pieces` (page ranges in order); by halves if it

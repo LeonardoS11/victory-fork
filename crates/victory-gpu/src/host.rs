@@ -8470,6 +8470,25 @@ impl Meter {
                 crate::frame::PACE_FREED.load(Ordering::Relaxed),
             ];
             let d: Vec<f64> = now.iter().zip(&SEEN).map(|(n, s)| (n - s.swap(*n, Ordering::Relaxed)) as f64 / frames).collect();
+            {
+                static SEEN_R: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+                let r: Vec<f64> = crate::watch::BY_RESERVATION
+                    .iter()
+                    .zip(&SEEN_R)
+                    .map(|(n, s)| {
+                        let n = n.load(Ordering::Relaxed);
+                        (n - s.swap(n, Ordering::Relaxed)) as f64 / frames
+                    })
+                    .collect();
+                if r.iter().any(|&v| v > 0.0) {
+                    tracing::info!(
+                        "write watch by reservation (VICTORY_WATCH_BY_RESERVATION=1), per frame: {:.1} askings, {:.2} of them failed, {:.2} reservations looked up",
+                        r[0],
+                        r[1],
+                        r[2]
+                    );
+                }
+            }
             if d.iter().any(|&v| v > 0.0) {
                 tracing::info!(
                     "per frame: {:.1} parts left to the thread releasing the queues' lines (VICTORY_RELEASE_HANDOFF=1), \
