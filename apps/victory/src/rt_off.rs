@@ -1,4 +1,4 @@
-//! `VICTORY_RT_OFF` (on unless set to `0`): the title's ray-tracing passes
+//! `VICTORY_RT_OFF=1` (off by default): the title's ray-tracing passes
 //! are not run. Their shaders are found by name in the package's shader
 //! file and handed to the GPU layer, which drops every pipeline made with
 //! one of them (not made on the host, its draws and dispatches not run).
@@ -40,7 +40,7 @@ fn traces(name: &str) -> bool {
 }
 
 fn on() -> bool {
-    std::env::var_os("VICTORY_RT_OFF").is_none_or(|v| v != "0")
+    std::env::var_os("VICTORY_RT_OFF").is_some_and(|v| v == "1")
 }
 
 /// The shader hashes of the ray-tracing passes in an SGD5 file.
@@ -56,7 +56,7 @@ fn hashes(file: &[u8]) -> HashSet<String> {
 /// `title_dir` to the GPU layer to drop.
 pub(crate) fn apply(title_dir: &Path) {
     if !on() {
-        println!("ray tracing    on (VICTORY_RT_OFF=0)");
+        println!("ray tracing    on (VICTORY_RT_OFF=1 drops its passes)");
         return;
     }
     let path = title_dir.join("shaders.rpf");
@@ -65,7 +65,7 @@ pub(crate) fn apply(title_dir: &Path) {
         Ok(file) => {
             let found = hashes(&file);
             println!(
-                "ray tracing    off: {} shaders of its passes dropped, found in {} in {:.1} s (VICTORY_RT_OFF=0 keeps it)",
+                "ray tracing    off: {} shaders of its passes dropped, found in {} in {:.1} s (VICTORY_RT_OFF=1)",
                 found.len(),
                 path.display(),
                 started.elapsed().as_secs_f64()
