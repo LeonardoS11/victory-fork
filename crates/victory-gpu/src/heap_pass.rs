@@ -27,6 +27,19 @@ pub(crate) const FULL_EVERY: u64 = 256;
 /// two looks at every slot with the old pass).
 pub(crate) const ORPHANS_EVERY: u64 = 16;
 
+/// Passes between looks at every kept slot's record with
+/// `VICTORY_HEAP_PASS_TRUST_SYNC=1` ([`trust_sync`]).
+pub(crate) const TRUSTED_EVERY: u64 = 8;
+
+/// Whether a pass leaves the records of kept slots to the copy sync and
+/// the API to tell of, looking at them all only every [`TRUSTED_EVERY`]
+/// passes (`VICTORY_HEAP_PASS_TRUST_SYNC=1`; off by default: a write to a
+/// heap in view memory the guards do not see is found that much later).
+pub(crate) fn trust_sync() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_TRUST_SYNC").is_some_and(|v| v == "1"))
+}
+
 /// Freed table entries a heap's pass keeps at most ([`Picked::note_forgotten`]).
 pub(crate) const FORGOTTEN_MOST: usize = 1 << 16;
 
@@ -70,6 +83,9 @@ pub(crate) struct Picked<C> {
     forgotten: Option<Vec<u32>>,
     /// The old pass (`VICTORY_HEAP_PASS_FULL=1`).
     full: bool,
+    /// Kept slots' records left to the copy sync but every
+    /// [`TRUSTED_EVERY`] passes ([`trust_sync`]).
+    trust: bool,
 }
 
 impl<C: Clone> Picked<C> {
@@ -82,6 +98,7 @@ impl<C: Clone> Picked<C> {
             by_entry: HashMap::new(),
             forgotten: None,
             full,
+            trust: trust_sync(),
         }
     }
 
@@ -155,9 +172,17 @@ impl<C: Clone> Picked<C> {
                 );
             }
         }
-        for (&slot, kept) in &self.slots {
-            if record(slot) != Some(kept.record) {
-                due.insert(slot);
+        // Every kept slot's record against the one seen (a write no one
+        // told of: a record copied in as bytes the copy sync did not see).
+        // With `VICTORY_HEAP_PASS_TRUST_SYNC=1` only every
+        // [`TRUSTED_EVERY`] passes: the copy sync and the API tell of the
+        // rest, and a write neither sees (view memory written past the
+        // guards) waits that long at most.
+        if !self.trust || pass.is_multiple_of(TRUSTED_EVERY) {
+            for (&slot, kept) in &self.slots {
+                if record(slot) != Some(kept.record) {
+                    due.insert(slot);
+                }
             }
         }
         let orphans_too = pass.is_multiple_of(ORPHANS_EVERY);
@@ -329,6 +354,29 @@ mod tests {
         Heap {
             records: (0..n).map(|s| (s, [1, 100 + s, 1])).collect(),
         }
+    }
+
+    /// With the copy sync trusted, a record copied past the API (no change
+    /// told) is found only at the pass that looks at every kept slot's
+    /// record, [`TRUSTED_EVERY`] passes apart; untrusted, at the next pass.
+    #[test]
+    fn a_trusted_sync_leaves_untold_records_to_every_eighth_pass() {
+        let mut heap = heap(64);
+        let mut p = Picked::new(false);
+        p.trust = true;
+        assert_eq!(pass(&mut p, &heap, vec![], vec![]).len(), 64);
+        heap.records.insert(9, [1, 900, 1]);
+        let mut found_at = None;
+        for n in 1..=TRUSTED_EVERY {
+            if pass(&mut p, &heap, vec![], vec![]) == vec![9] {
+                found_at = Some(n);
+                break;
+            }
+        }
+        assert_eq!(found_at, Some(TRUSTED_EVERY), "found at the pass that looks at all records");
+        // A change told (written through the API) is looked at at once.
+        heap.records.insert(5, [1, 500, 1]);
+        assert_eq!(pass(&mut p, &heap, vec![5], vec![]), vec![5]);
     }
 
     /// A heap whose pass does not run is told of the freed entries at

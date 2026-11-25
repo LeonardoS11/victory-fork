@@ -8336,12 +8336,14 @@ impl Meter {
                 [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_SLOT_COST[i].swap(0, Ordering::Relaxed) as f64);
             let [remade, same, early] =
                 [0, 1, 2].map(|i| crate::draw::HEAP_REMADE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [hits, lookups] =
+                [0, 1].map(|i| crate::draw::VIEW_COPY_HITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if timed > 0.0 {
                 tracing::info!(
                     "a slot of the heap buffer pass ({picked_mode}): picking the slots {:.2} ms a frame; of one in \
                      eight, {:.2} us making it, {:.2} us finding its host copy, {:.2} us keeping it; per frame \
                      {remade:.0} made again, {same:.0} found made from their record (skipped), {early:.0} unchanged \
-                     since kept (skipped before making)",
+                     since kept (skipped before making); host copies {hits:.0} known by view, {lookups:.0} looked up",
                     plan_us / 1e3 / frames,
                     mirror_ns / timed / 1e3,
                     copy_ns / timed / 1e3,
