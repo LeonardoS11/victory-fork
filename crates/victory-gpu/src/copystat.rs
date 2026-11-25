@@ -1076,12 +1076,25 @@ pub(crate) fn present_begins() {
     add(C::TailUs, now_us().saturating_sub(SUBMITTED_AT.load(Relaxed)));
 }
 
+/// Whether our own per-frame measuring is off (`VICTORY_DIAG_QUIET=1`):
+/// the distinct-page sets and the sampled compares of copies, the
+/// write-watch probe at a present, the census of stale table slots, the
+/// heap pass's one-in-eight slot timing. The frame-rate line, the frame log
+/// and the scripted keys stay.
+pub(crate) fn quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIAG_QUIET").is_some_and(|v| v == "1"))
+}
+
 /// Distinct 4 KiB pages of this frame: copied into host copies, and
 /// reported written by the write watch.
 static PAGES: Mutex<Option<(std::collections::HashSet<usize>, std::collections::HashSet<usize>)>> = Mutex::new(None);
 
 /// Title memory `[from, to)` was copied into a host copy.
 pub(crate) fn pages_copied(from: usize, to: usize) {
+    if quiet() {
+        return;
+    }
     let mut p = PAGES.lock().unwrap_or_else(|e| e.into_inner());
     let (copied, _) = p.get_or_insert_with(Default::default);
     copied.extend(from / 4096..to.div_ceil(4096));
@@ -1089,6 +1102,9 @@ pub(crate) fn pages_copied(from: usize, to: usize) {
 
 /// The write watch reported these pages (addresses) written.
 pub(crate) fn pages_written(pages: &[usize]) {
+    if quiet() {
+        return;
+    }
     let mut p = PAGES.lock().unwrap_or_else(|e| e.into_inner());
     let (_, written) = p.get_or_insert_with(Default::default);
     written.extend(pages.iter().map(|a| a / 4096));
@@ -1102,6 +1118,9 @@ pub(crate) fn sampled_pieces(pieces: u64, changed: u64) {
 
 /// Whether this copy into a host copy is one of the eight sampled.
 pub(crate) fn sample_copy() -> bool {
+    if quiet() {
+        return false;
+    }
     static N: AtomicU64 = AtomicU64::new(0);
     N.fetch_add(1, Relaxed).is_multiple_of(8)
 }

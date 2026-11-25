@@ -2112,6 +2112,10 @@ impl HostHeap {
         if self.defers() || !census_on() || self.pending.is_empty() {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::quiet() {
+            return;
+        }
         let frame = crate::frame::current();
         // One frame in 16: the walk over the marks cost 2.8 ms of the
         // submitting thread's frame when done at every one (Series S

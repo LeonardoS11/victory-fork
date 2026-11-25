@@ -180,6 +180,25 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// Whether this submission syncs the records the title copied into its
+/// heaps as bytes (`crate::descriptor::sync_heaps`). With
+/// `VICTORY_HEAP_SYNC_FRAME=1` only the frame's first does (off by default:
+/// every submission, as before). The sync took 8.9 ms a frame at 29
+/// submissions (Series S profile); what reads its slots is a draw through
+/// a table, which makes its own view from the record, or a shader picking
+/// by index, whose pass runs once a frame. What it gives up: a record
+/// copied in between two submissions of one frame and read by index in the
+/// later one is read as it was until the next frame.
+fn heap_sync_now() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_FRAME").is_some_and(|v| v == "1")) {
+        return true;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let frame = crate::frame::current();
+    LAST.swap(frame, Ordering::Relaxed) != frame
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -5835,7 +5854,10 @@ impl Host {
         }
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // `VICTORY_HEAP_SYNC_FRAME=1`: at the frame's first submission only.
+        if heap_sync_now() {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the

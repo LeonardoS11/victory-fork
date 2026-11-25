@@ -435,6 +435,9 @@ static PROBE: Mutex<(bool, u64, Vec<(usize, usize, u64)>)> = Mutex::new((false, 
 /// A successful kernel asking of `len` bytes at `start` took `us`.
 #[cfg(feature = "diagnostics")]
 fn probe_note(start: usize, len: usize, us: u64) {
+    if crate::copystat::quiet() {
+        return;
+    }
     let mut p = PROBE.lock().unwrap_or_else(|e| e.into_inner());
     if p.0 {
         p.2.push((start, len, us));
@@ -445,6 +448,9 @@ fn probe_note(start: usize, len: usize, us: u64) {
 /// starts one every [`PROBE_EVERY`] frames.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn probe_presented() {
+    if crate::copystat::quiet() {
+        return;
+    }
     #[cfg(feature = "diagnostics")]
     {
         use windows_sys::Win32::System::Memory::{GetWriteWatch, MEMORY_BASIC_INFORMATION, VirtualQuery};

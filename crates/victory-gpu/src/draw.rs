@@ -563,6 +563,14 @@ fn view_copy_cache() -> bool {
 /// found in [`VIEW_COPIES`], and looked up.
 pub(crate) static VIEW_COPY_HITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// [`crate::copystat::quiet`], in every build (false without diagnostics).
+fn diag_quiet() -> bool {
+    #[cfg(feature = "diagnostics")]
+    return crate::copystat::quiet();
+    #[cfg(not(feature = "diagnostics"))]
+    return false;
+}
+
 /// Of the slots those passes looked at: made again, and found made from
 /// the record they hold (skipped).
 /// (and, last, those skipped before any of that: kept with the record
@@ -1654,7 +1662,7 @@ impl State {
             ranges.forget(index);
             let entry = crate::descriptor::record_entry(record);
             // One slot in eight is timed, step by step.
-            let timed = (n % 8 == 0).then(std::time::Instant::now);
+            let timed = (n % 8 == 0 && !diag_quiet()).then(std::time::Instant::now);
             if timed.is_some() {
                 HEAP_SLOT_COST[4].fetch_add(1, Ordering::Relaxed);
             }
