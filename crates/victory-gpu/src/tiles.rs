@@ -706,7 +706,7 @@ pub(crate) fn give_back_let_go() {
 
 /// [`give_back_let_go`] in frame `now`.
 fn give_back_let_go_at(now: u64) {
-    let done: Vec<(ID3D12Resource, Tiled)> = {
+    let done: Vec<(ID3D12Resource, Tiled, u64)> = {
         let mut waiting = LET_GO.lock().unwrap_or_else(|e| e.into_inner());
         if waiting.is_empty() {
             return;

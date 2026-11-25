@@ -3492,7 +3492,7 @@ fn late_helper() {
         };
         let Some(target) = target else {
             land();
-            crate::queue::release_held(false);
+            crate::queue::release_held_or_hand_off();
             continue;
         };
         // The card first, without the submission lock: the submitting
@@ -3513,7 +3513,7 @@ fn late_helper() {
             host.settle(&mut submitted, WHY_CARD_DONE);
         }
         land();
-        crate::queue::release_held(false);
+        crate::queue::release_held_or_hand_off();
     }
 }
 
@@ -8333,6 +8333,23 @@ impl Meter {
         let [picked_slots, picked_copies] =
             [0, 1].map(|i| crate::draw::HEAP_BUFFER_VISITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         let picked_mode = if crate::heap_pass::full_pass() { "full" } else { "marked" };
+        {
+            static SEEN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+            let now = [
+                crate::queue::HANDED_OFF[0].load(Ordering::Relaxed),
+                crate::queue::HANDED_OFF[1].load(Ordering::Relaxed),
+                crate::frame::PACE_FREED.load(Ordering::Relaxed),
+            ];
+            let d: Vec<f64> = now.iter().zip(&SEEN).map(|(n, s)| (n - s.swap(*n, Ordering::Relaxed)) as f64 / frames).collect();
+            if d.iter().any(|&v| v > 0.0) {
+                tracing::info!(
+                    "per frame: {:.1} parts left to the thread releasing the queues' lines (VICTORY_RELEASE_HANDOFF=1),                      {:.1} turns it took again for them; {:.1} frame waits that did not sleep (VICTORY_PACE_FREE=1)",
+                    d[0],
+                    d[1],
+                    d[2]
+                );
+            }
+        }
         {
             let [plan_us, mirror_ns, copy_ns, keep_ns, timed] =
                 [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_SLOT_COST[i].swap(0, Ordering::Relaxed) as f64);

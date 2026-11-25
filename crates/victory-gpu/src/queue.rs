@@ -337,7 +337,7 @@ fn submit_cut(this: This, lists: &[This]) {
     }
     // What ran may be what another queue waits for, and what was just
     // given to the queue may be free to run already.
-    release_held(false);
+    release_held_or_hand_off();
 }
 
 /// A submission to a queue that honours waits, list by list ([`split`]).
@@ -459,6 +459,19 @@ pub(crate) fn release_held(all: bool) {
         return;
     }
     release_held_now(all);
+}
+
+/// [`release_held`] for a caller that need not see its part sent before it
+/// returns ([`release_handoff`]).
+pub(crate) fn release_held_or_hand_off() {
+    if behind() {
+        wake();
+        return;
+    }
+    #[cfg(windows)]
+    release_held_now_with(false, true);
+    #[cfg(not(windows))]
+    release_held_now(false);
 }
 
 /// Whether a submission is only put in its queue's line by the thread
@@ -741,12 +754,84 @@ pub(crate) fn before_sync() {
 
 #[cfg(windows)]
 fn release_held_now(all: bool) {
+    release_held_now_with(all, false);
+}
+
+/// Whether a thread that finds another releasing what the queues hold
+/// leaves its part to that one instead of waiting for it
+/// (`VICTORY_RELEASE_HANDOFF=1`; off by default).
+///
+/// One releaser at a time keeps a queue's submissions in order, and the
+/// releaser holds that turn while it prepares and sends a submission (a
+/// whole `Host::submit`). The title's submitting thread, having put its
+/// lists in the line, waited 34 ms a frame for the late-wait thread's turn
+/// (Series S profile, 97 ms frames): the releaser loops until nothing more
+/// is free to run, so it sends those lists too, in their order. A thread
+/// that hands off marks [`AGAIN`]; the releaser looks once more after it
+/// lets go of its turn if the mark is set, so nothing is left in a line.
+#[cfg(windows)]
+fn release_handoff() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELEASE_HANDOFF").is_some_and(|v| v == "1"))
+}
+
+/// A thread left its part to the releaser ([`release_handoff`]).
+#[cfg(windows)]
+static AGAIN: AtomicBool = AtomicBool::new(false);
+
+/// Since the start: parts left to the releaser, and turns taken again for
+/// them.
+#[cfg(windows)]
+pub(crate) static HANDED_OFF: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// [`release_held_now`]; `hand_off`: if another thread is releasing, leave
+/// what this one put in the lines to it ([`release_handoff`]). Only for
+/// callers that do not need it sent when this returns (a submission put in
+/// its line, the late-wait thread); a present or a submission of ours that
+/// is waited for waits its turn.
+#[cfg(windows)]
+fn release_held_now_with(all: bool, hand_off: bool) {
+    loop {
+        release_turn(all, hand_off && !all && release_handoff());
+        if !(hand_off && release_handoff() && AGAIN.swap(false, Ordering::SeqCst)) {
+            break;
+        }
+        HANDED_OFF[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn release_turn(all: bool, hand_off: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
-    let _one = lock(&RELEASING);
+    let _one = if hand_off {
+        match RELEASING.try_lock() {
+            Ok(turn) => turn,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Marked first, then tried once more: a releaser letting go
+                // between the two either sees the mark or leaves the turn.
+                AGAIN.store(true, Ordering::SeqCst);
+                match RELEASING.try_lock() {
+                    Ok(turn) => turn,
+                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        HANDED_OFF[0].fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+        }
+    } else {
+        lock(&RELEASING)
+    };
+    if hand_off {
+        // This turn looks at everything in the lines now.
+        AGAIN.store(false, Ordering::SeqCst);
+    }
     let was_here = RELEASING_HERE.replace(true);
     struct Leave(bool);
     impl Drop for Leave {

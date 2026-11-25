@@ -2106,7 +2106,10 @@ impl HostHeap {
             return;
         }
         let frame = crate::frame::current();
-        if self.censused.swap(frame + 1, Relaxed) == frame + 1 {
+        // One frame in 16: the walk over the marks cost 2.8 ms of the
+        // submitting thread's frame when done at every one (Series S
+        // profile); the line gives the average over the censuses taken.
+        if !frame.is_multiple_of(16) || self.censused.swap(frame + 1, Relaxed) == frame + 1 {
             return;
         }
         let marked = self.pending.marked();
