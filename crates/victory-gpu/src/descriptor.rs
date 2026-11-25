@@ -262,6 +262,15 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Runs `f` with the title heap at `heap` if it is still registered (it is
+/// live while it is: removed when dropped, under the same lock).
+#[cfg(windows)]
+pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T> {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: registered heaps are live (removed when dropped).
+    heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
+}
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
 /// not the one last seen (mirrored), and the microseconds it took.

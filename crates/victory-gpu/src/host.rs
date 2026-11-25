@@ -16,6 +16,8 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
+
+pub(crate) mod aside;
 use windows::core::{Interface, PCWSTR, w};
 
 /// Resource states without the console's own bits (compression hints from
@@ -1098,6 +1100,9 @@ pub(crate) struct HostList {
     window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
+    /// Refreshes a thread of ours is finding for the list
+    /// ([`HostList::refreshes_coming`]), and where among its steps they go.
+    coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
     /// The pair of timestamps its run is timed with since its last reset
     /// (`crate::cardmeter`), or none.
     meter: AtomicU32,
@@ -4295,6 +4300,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
                 _alive: Counted::new(),
+                coming: Mutex::default(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
                 gather: Mutex::default(),
@@ -6473,6 +6479,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.take_coming();
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -7178,6 +7185,35 @@ impl HostList {
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
+    /// `work` finds, on a thread of ours, refreshes that belong at this
+    /// place among the list's steps; they are there when the list is closed.
+    pub(crate) fn refreshes_coming(&self, work: impl FnOnce() -> Vec<aside::Refresh> + Send + 'static) {
+        self.take_coming();
+        let at = self.deferred().copies.len();
+        let coming = aside::begin(work);
+        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
+    }
+
+    /// The refreshes that were still to come are put among the steps (each
+    /// range once, as [`HostList::defer_refresh`] has it).
+    fn take_coming(&self) {
+        let Some((at, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        let found = coming.wait();
+        let mut deferred = self.deferred();
+        let mut steps = Vec::with_capacity(found.len());
+        for (shadow, from, to) in found {
+            let len = shadow.clamped(from, to - from);
+            let key = (std::sync::Arc::as_ptr(&shadow) as usize, from as usize, len as usize);
+            if deferred.refreshed.insert(key) {
+                steps.push(Step::Refresh(shadow, from as usize, len as usize));
+            }
+        }
+        let at = at.min(deferred.copies.len());
+        deferred.copies.splice(at..at, steps);
+    }
+
     pub(crate) fn defer_refresh(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -8462,6 +8498,12 @@ impl Meter {
         let [picked_slots, picked_copies] =
             [0, 1].map(|i| crate::draw::HEAP_BUFFER_VISITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         let picked_mode = if crate::heap_pass::full_pass() { "full" } else { "marked" };
+        if aside::on() {
+            tracing::info!(
+                "heap pass aside (VICTORY_HEAP_PASS_ASIDE=1): lists waited {:.2} ms per frame at their close for it",
+                aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames
+            );
+        }
         {
             static SEEN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
             let now = [

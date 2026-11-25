@@ -2796,6 +2796,11 @@ impl Shadow {
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
+    /// `len` bytes from `address` on, or fewer: as far as this copy goes.
+    pub(crate) fn clamped(&self, address: u64, len: u64) -> u64 {
+        len.min(self.start + self.len - address)
+    }
+
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
