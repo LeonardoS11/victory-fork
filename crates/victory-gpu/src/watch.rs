@@ -1448,10 +1448,13 @@ pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
         Ok("0") => 0,
-        Ok("guards") => 1,
+        Ok("1") | Ok("both") => 3,
         Ok("slots") => 2,
         Ok("all") => 7,
-        _ => 3,
+        // Bit 1 alone again by default (`guards`): with bit 2 on by default
+        // the picture of the Series X profile lost its wire fence and the
+        // light of the room and the shirt (run T2, under isolation).
+        _ => 1,
     })
 }
 

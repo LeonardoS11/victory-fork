@@ -654,17 +654,42 @@ impl Drop for Tiled {
 /// mappings: the device was removed seconds after a sweep that let go 610
 /// host copies, with a heap given back. Here the tiles stay given until
 /// the texture is ours alone.
-static LET_GO: Mutex<Vec<(ID3D12Resource, Tiled)>> = Mutex::new(Vec::new());
+///
+/// And not before [`hold_frames`] frames have been presented since the
+/// let-go: a shader that picks a texture from the heap by index reads it
+/// through a slot, and the list that recorded it holds nothing of it; a
+/// slot made again meanwhile leaves the texture named by nothing while
+/// lists sent before still read it on the card. Tiles given back under
+/// them was a device lost 0.7 s after a sweep that let go 144 host copies
+/// (Series X, run T2).
+static LET_GO: Mutex<Vec<(ID3D12Resource, Tiled, u64)>> = Mutex::new(Vec::new());
+
+/// Frames a let-go texture's tiles stay given after nothing names it
+/// (`VICTORY_TILES_HOLD_FRAMES`, 3; 0: given back at once, as before).
+fn hold_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TILES_HOLD_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(3)
+    })
+}
 
 /// `texture`'s host copy is let go: its tiles go back once nothing else
 /// names `texture` ([`give_back_let_go`]); at once if nothing does now.
 pub(crate) fn let_go(texture: ID3D12Resource, tiled: Tiled) {
-    if crate::host::references(&texture) == 1 {
+    let_go_at(texture, tiled, crate::frame::current());
+}
+
+/// [`let_go`] in frame `frame`.
+fn let_go_at(texture: ID3D12Resource, tiled: Tiled, frame: u64) {
+    if hold_frames() == 0 && crate::host::references(&texture) == 1 {
         drop(texture);
         drop(tiled);
         return;
     }
-    LET_GO.lock().unwrap_or_else(|e| e.into_inner()).push((texture, tiled));
+    LET_GO.lock().unwrap_or_else(|e| e.into_inner()).push((texture, tiled, frame));
 }
 
 /// The host copies let go whose tiles still wait (tests).
@@ -676,18 +701,24 @@ fn let_go_waiting() -> usize {
 /// Gives back the tiles of textures let go that nothing else names now
 /// (the sweep calls it; lists drop what they keep when they are reset).
 pub(crate) fn give_back_let_go() {
+    give_back_let_go_at(crate::frame::current());
+}
+
+/// [`give_back_let_go`] in frame `now`.
+fn give_back_let_go_at(now: u64) {
     let done: Vec<(ID3D12Resource, Tiled)> = {
         let mut waiting = LET_GO.lock().unwrap_or_else(|e| e.into_inner());
         if waiting.is_empty() {
             return;
         }
-        let (done, keep): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut *waiting).into_iter().partition(|(texture, _)| crate::host::references(texture) == 1);
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut *waiting)
+            .into_iter()
+            .partition(|(texture, _, at)| crate::host::references(texture) == 1 && now >= at + hold_frames());
         *waiting = keep;
         done
     };
     // The texture first, then its tiles (`Tiled`'s drop gives them back).
-    for (texture, tiled) in done {
+    for (texture, tiled, _) in done {
         drop(texture);
         drop(tiled);
     }
@@ -1497,20 +1528,27 @@ void look() {
         let waiting = super::let_go_waiting();
         // A list recorded or in the air keeps the texture.
         let kept_by_a_list = texture.clone();
-        super::let_go(texture, tiled);
+        let hold = super::hold_frames();
+        let at = 1_000_000;
+        super::let_go_at(texture, tiled, at);
         assert_eq!(super::let_go_waiting(), waiting + 1, "the tiles wait while the list keeps the texture");
-        super::give_back_let_go();
+        super::give_back_let_go_at(at + hold);
         assert_eq!(super::let_go_waiting(), waiting + 1, "still kept: still waiting");
         // The list is reset: it lets go of the texture.
         drop(kept_by_a_list);
-        super::give_back_let_go();
-        assert_eq!(super::let_go_waiting(), waiting, "nothing names the texture: its tiles go back");
-        // And a texture nothing else names gives them back at once.
+        if hold > 0 {
+            super::give_back_let_go_at(at + hold - 1);
+            assert_eq!(super::let_go_waiting(), waiting + 1, "named by nothing, but lists sent before may read it");
+        }
+        super::give_back_let_go_at(at + hold);
+        assert_eq!(super::let_go_waiting(), waiting, "nothing names the texture and its frames are past: tiles back");
+        // A texture nothing else names: its tiles too wait the frames.
         let (texture, tiled) = rig.reserved(&desc);
         rig.give(&tiled, &texture, tiled.with_level(0));
         rig.run(|_| {});
-        super::let_go(texture, tiled);
-        assert_eq!(super::let_go_waiting(), waiting, "given back at once");
+        super::let_go_at(texture, tiled, at);
+        super::give_back_let_go_at(at + hold);
+        assert_eq!(super::let_go_waiting(), waiting, "given back once its frames are past");
     }
 
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.

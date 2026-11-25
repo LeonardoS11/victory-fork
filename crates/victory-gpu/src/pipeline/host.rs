@@ -216,6 +216,11 @@ impl GraphicsState {
     /// the title's state. (From fork PR #995.)
     fn host_blend(&self) -> D3D12_BLEND_DESC {
         let mut blend = self.blend;
+        // `VICTORY_HOST_BLEND=0`: the title's blend state as it is.
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_HOST_BLEND").is_none_or(|v| v != "0")) {
+            return blend;
+        }
         let n = (self.targets.NumRenderTargets as usize).min(8);
         let enabled = |rt: &D3D12_RENDER_TARGET_BLEND_DESC| rt.BlendEnable.as_bool();
         let first = blend.RenderTarget[0];
