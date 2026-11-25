@@ -46,6 +46,8 @@ mod heap_pass;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+mod compose;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
