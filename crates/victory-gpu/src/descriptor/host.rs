@@ -2025,8 +2025,12 @@ impl HostHeap {
             due.extend(zeroed);
             due.sort_unstable_by_key(|d| d.0);
         }
+        // As `mirror_copied`: the fingerprint just taken stays (`mirror`
+        // would clear it when the slot changes, and the same bytes would be
+        // mirrored again at the next write of the page).
         for &(index, handle, _) in &due {
-            self.mirror(index, handle, false);
+            let (_, remade) = self.mirror_counted(index, handle, false, false);
+            COPIED_REMADE[usize::from(!remade)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         (looked, due.len() as u64)
     }
@@ -2083,7 +2087,13 @@ impl HostHeap {
             if let Some(last) = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
                 *last = record_print(&record) | 1;
             }
-            let part = match self.mirror_inner(index, handle, false, false) {
+            let (view, remade) = self.mirror_counted(index, handle, false, false);
+            if !remade {
+                // Made from this record already: nothing to do.
+                DEFERRED[5].fetch_add(1, Relaxed);
+                continue;
+            }
+            let part = match view {
                 Some(view) if view.is_buffer() => 2,
                 Some(view) if is_texture_view(&view) => 3,
                 _ => 4,
@@ -2100,16 +2110,32 @@ impl HostHeap {
         self.mirror_inner(index, handle, for_draw, true)
     }
 
+    /// [`HostHeap::mirror`] for a draw, from the pass over buffer views
+    /// shaders pick by index: the record it reads is the title's now, the
+    /// one the pass over records copied in as bytes compares with, so the
+    /// fingerprint of that pass is left as it is (`mirror` clears it when
+    /// the slot changes, under the lock that pass holds for a whole page).
+    /// Also says whether the slot was made again (false: its record names
+    /// the view it was made from, and nothing was done).
+    pub(crate) fn mirror_for_pass(&self, index: u32, handle: u64) -> (Option<View>, bool) {
+        self.mirror_counted(index, handle, true, false)
+    }
+
+    fn mirror_inner(&self, index: u32, handle: u64, for_draw: bool, invalidate_copied: bool) -> Option<View> {
+        self.mirror_counted(index, handle, for_draw, invalidate_copied).0
+    }
+
     /// Shared implementation of [`HostHeap::mirror`] and
     /// [`HostHeap::mirror_copied`]. When `invalidate_copied` is true and
     /// `made[index]` changes, clears `self.copied[index]` after dropping `made`.
-    fn mirror_inner(
+    /// The flag: whether the slot was made (or unmade) again.
+    fn mirror_counted(
         &self,
         index: u32,
         handle: u64,
         for_draw: bool,
         invalidate_copied: bool,
-    ) -> Option<View> {
+    ) -> (Option<View>, bool) {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2122,7 +2148,7 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return (None, false);
         }
         // Made from the record there now: no longer pending.
         self.pending.take(index);
@@ -2132,6 +2158,7 @@ impl HostHeap {
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut stale_unmade: Vec<u32> = Vec::new();
         let mut self_changed = false;
+        let mut remade = false;
         let result = {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
@@ -2152,6 +2179,7 @@ impl HostHeap {
                 }
                 Some(view) => {
                     if made[index as usize] != key {
+                        remade = true;
                         // Views of other textures in the memory this one describes
                         // are stale: their host slots read nothing from here on, and
                         // let go of the host copies they held.
@@ -2212,7 +2240,7 @@ impl HostHeap {
         for stale in stale_unmade {
             self.forget_copied(stale);
         }
-        result
+        (result, remade || self_changed)
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -2467,7 +2495,13 @@ pub(crate) fn tabled_defer() -> bool {
 /// made by draws through their tables; made by the sweep as buffer views
 /// (then the buffer pass's), as texture views (then the texture pass's),
 /// as anything else.
-pub(crate) static DEFERRED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// (and, last, those the sweep found made from their record already).
+pub(crate) static DEFERRED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Since the last frame line: records copied in as bytes that the page's
+/// pass mirrored and that made their slot again, and that named the view
+/// the slot was made from already (nothing done).
+pub(crate) static COPIED_REMADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// A record of `dst.len()` bytes at `handle`, read through the kernel.
 fn read_record(handle: u64, dst: &mut [u8]) -> bool {
