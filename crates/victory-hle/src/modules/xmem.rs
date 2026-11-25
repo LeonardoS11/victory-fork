@@ -162,8 +162,8 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
-    // Committed: what the GPU side found uncommitted there is no longer so
-    // (it looks again only now and then otherwise).
+    // Memory committed for the title: the GPU side's notes that blocks there
+    // are uncommitted go (parked view blocks, and `VICTORY_ABSENT_ONCE`'s).
     if !at.is_null() && kind & MEM_COMMIT != 0 {
         victory_gpu::title_memory_committed(at as usize, size);
     }
