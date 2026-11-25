@@ -378,6 +378,11 @@ pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }
 pub(crate) static HEAP_PASS_MICROS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Slots looked at by those passes, and host copies brought up to date.
 pub(crate) static HEAP_BUFFER_VISITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// What a slot of those passes costs: the microseconds of picking the
+/// slots (`heap_pass` plan, every slot), and of one slot in eight the
+/// nanoseconds of making it (`mirror`), of finding its host copy
+/// (`buffer_copy`) and of keeping it, and the slots so timed.
+pub(crate) static HEAP_SLOT_COST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1424,12 +1429,14 @@ impl State {
             .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
         let changed = host.buffer_changes();
         let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
+        let planning = std::time::Instant::now();
         let slots = ranges.plan(
             changed,
             || host.buffer_slots(),
             record,
             crate::descriptor::record_entry,
         );
+        HEAP_SLOT_COST[0].fetch_add(planning.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1443,7 +1450,20 @@ impl State {
             // Read before the slot is made: a write after it is seen next pass.
             let record = crate::descriptor::record_at(handle);
             let entry = crate::descriptor::record_entry(record);
-            let Some(view) = host.mirror(index, handle, true) else {
+            // One slot in eight is timed, step by step.
+            let timed = (n % 8 == 0).then(std::time::Instant::now);
+            if timed.is_some() {
+                HEAP_SLOT_COST[4].fetch_add(1, Ordering::Relaxed);
+            }
+            let step = |part: usize, since: Option<std::time::Instant>| {
+                since.map(|t| {
+                    HEAP_SLOT_COST[part].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    std::time::Instant::now()
+                })
+            };
+            let mirrored = host.mirror(index, handle, true);
+            let timed = step(1, timed);
+            let Some(view) = mirrored else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1463,7 +1483,9 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let copy = crate::descriptor::host::buffer_copy(&view);
+            let timed = step(2, timed);
+            let Some((shadow, address, len)) = copy else {
                 // A buffer view whose memory has no host copy (yet): tried
                 // again every 16 passes. (Other views: left out until
                 // written, as before.)
@@ -1478,6 +1500,7 @@ impl State {
             }
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             ranges.keep(index, key, &shadow, address, address + len, record, entry);
+            step(3, timed);
         }
         let views = ranges.views() as u32;
         let looked = started.elapsed();

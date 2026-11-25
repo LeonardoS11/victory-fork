@@ -7657,6 +7657,19 @@ impl Meter {
         let [picked_slots, picked_copies] =
             [0, 1].map(|i| crate::draw::HEAP_BUFFER_VISITS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         let picked_mode = if crate::heap_pass::full_pass() { "full" } else { "marked" };
+        {
+            let [plan_us, mirror_ns, copy_ns, keep_ns, timed] =
+                [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_SLOT_COST[i].swap(0, Ordering::Relaxed) as f64);
+            if timed > 0.0 {
+                tracing::info!(
+                    "a slot of the heap buffer pass ({picked_mode}): picking the slots {:.2} ms a frame; of one in                      eight, {:.2} us making it, {:.2} us finding its host copy, {:.2} us keeping it",
+                    plan_us / 1e3 / frames,
+                    mirror_ns / timed / 1e3,
+                    copy_ns / timed / 1e3,
+                    keep_ns / timed / 1e3,
+                );
+            }
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
