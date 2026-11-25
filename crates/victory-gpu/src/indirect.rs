@@ -270,6 +270,7 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    unkeep(list, &dst);
     // (timed as ours with `VICTORY_GPU_TIMING`: the dispatch and its two waits)
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("ours: indirect clamp of {} records", spec.2));
@@ -293,6 +294,7 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    unkeep(list, &dst);
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("ours: indirect clamp ahead of {} records", spec.2));
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
@@ -429,7 +431,31 @@ fn record_clamp_as(
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
+    if keep_args() {
+        list.set_indirect_kept(scratch);
+        return;
+    }
     done_on(&list.list, scratch);
+}
+
+/// Whether the scratch buffer stays in `INDIRECT_ARGUMENT` between the
+/// executions that read it (`VICTORY_INDIRECT_KEEP=1`; off by default):
+/// each execution ended with a transition of it back to `COMMON`, a
+/// barrier between every two indirect draws, even those reading a window
+/// clamped once for many of them ([`bound_ahead`]). Here it goes back only
+/// when a clamp is about to write it again; a buffer decays to `COMMON`
+/// when its submission ends, so a list starts with it there as before.
+pub(crate) fn keep_args() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_KEEP").is_some_and(|v| v == "1"))
+}
+
+/// Before a clamp writes `scratch`: back to `COMMON` if the list left it in
+/// `INDIRECT_ARGUMENT` ([`keep_args`]).
+fn unkeep(list: &HostList, scratch: &ID3D12Resource) {
+    if keep_args() && list.take_indirect_kept(scratch) {
+        done_on(&list.list, scratch);
+    }
 }
 
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
