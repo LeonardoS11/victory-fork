@@ -170,6 +170,60 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Whether a thread of ours runs [`sync_heaps`] when the title closes a
+/// list (`VICTORY_HEAP_SYNC_AHEAD=1`; off by default), so that a
+/// submission's own pass finds only what changed since.
+///
+/// The pages of the heaps written since the last pass are taken by
+/// whoever passes ([`sync_heaps`] holds `SYNCING`), so a pass ahead leaves
+/// the submission's pass the rest: some 650 records and 8 pages a
+/// submission, ~19 ms a frame of the submitting thread when all of it was
+/// done there (Series S, run AE3). A slot is made when the title has
+/// written its record, as the console's card reads it then, not later.
+#[cfg(windows)]
+pub(crate) fn sync_ahead_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_HEAP_SYNC_AHEAD").is_some_and(|v| v == "1");
+        if on {
+            let _ = std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(|| {
+                crate::framelog::keep_on_fast_cores("victory-heap-ahead");
+                loop {
+                    {
+                        let mut due = AHEAD_DUE.0.lock().unwrap_or_else(|e| e.into_inner());
+                        while !*due {
+                            due = AHEAD_DUE.1.wait(due).unwrap_or_else(|e| e.into_inner());
+                        }
+                        *due = false;
+                    }
+                    let began = std::time::Instant::now();
+                    sync_heaps();
+                    AHEAD_PASSES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    AHEAD_PASSES[1].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        on
+    })
+}
+
+#[cfg(windows)]
+static AHEAD_DUE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Since the last frame line, with [`sync_ahead_on`]: passes ahead and
+/// their microseconds.
+#[cfg(windows)]
+pub(crate) static AHEAD_PASSES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The title closed a list: a pass ahead is due ([`sync_ahead_on`]).
+#[cfg(windows)]
+pub(crate) fn sync_ahead_poke() {
+    if sync_ahead_on() {
+        *AHEAD_DUE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        AHEAD_DUE.1.notify_one();
+    }
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
@@ -374,6 +428,13 @@ pub(crate) fn sync_line(frames: f64) {
         tracing::info!(
             "of those mirrored per frame: {remade:.1} made their slot again, {same:.1} named the view it was made \
              from (skipped)"
+        );
+    }
+    if sync_ahead_on() {
+        let [passes, micros] = [0, 1].map(|i| AHEAD_PASSES[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "heap records synced ahead (VICTORY_HEAP_SYNC_AHEAD=1), per frame: {passes:.0} passes at lists' close, {:.2} ms on our thread",
+            micros / 1000.0
         );
     }
     if host::heap_make_wide() > 1 {

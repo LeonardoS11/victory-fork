@@ -630,6 +630,10 @@ extern "system" fn close(this: This) -> HRESULT {
     if let Some(host) = host_list(this) {
         host.close();
     }
+    // `VICTORY_HEAP_SYNC_AHEAD`: what the title wrote into its heaps for
+    // this list is synced now, beside it.
+    #[cfg(windows)]
+    crate::descriptor::sync_ahead_poke();
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
