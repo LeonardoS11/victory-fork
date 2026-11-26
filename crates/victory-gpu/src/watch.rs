@@ -167,6 +167,11 @@ pub(crate) fn views_once() -> bool {
 static OPENED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static OPENED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Times [`OPENED`] was emptied (under its lock): an asking aside of view
+/// memory ([`ask_aside`]) made while it held a count still sees in it every
+/// block opened since, while the count is the same.
+static OPENED_CLEARS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Blocks `[first, last)` changed in a way the guards' asking for the
 /// submission did not see ([`OPENED`]).
 fn opened(first: usize, last: usize) {
@@ -404,7 +409,45 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
 thread_local! {
     /// [`ask_aside`] on this thread: its number and the page ranges it
     /// asked (in order, apart).
-    static ASIDE: std::cell::RefCell<Option<(u64, Vec<(usize, usize)>)>> = const { std::cell::RefCell::new(None) };
+    static ASIDE: std::cell::RefCell<Option<AsideAsking>> = const { std::cell::RefCell::new(None) };
+}
+
+/// An asking of [`ask_aside`]: its number, the page ranges the kernel was
+/// asked about, the page ranges of view memory the guards were asked about
+/// (in order, apart), and [`OPENED_CLEARS`] when they were asked.
+struct AsideAsking {
+    now: u64,
+    kernel: Vec<(usize, usize)>,
+    views: Vec<(usize, usize)>,
+    clears: u64,
+}
+
+impl AsideAsking {
+    /// The answer for pages `[first, last)`, if the asking holds them: from
+    /// the journal for a range inside its kernel askings; for view memory
+    /// (`guarded`) inside its views where no block was opened since; `Some(None)`
+    /// for view memory asked unguarded (not write-watched, as the kernel
+    /// would say).
+    fn answer(&self, first: usize, last: usize, guarded: bool) -> Option<Option<(u64, Vec<(usize, u64)>)>> {
+        let collect = || {
+            let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+            Some((self.now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        };
+        if apart_holds(&self.kernel, first, last) {
+            return Some(collect());
+        }
+        if !apart_holds(&self.views, first, last) {
+            return None;
+        }
+        if !guarded {
+            return Some(None);
+        }
+        // Emptied since: blocks opened in between are not known.
+        if OPENED_CLEARS.load(std::sync::atomic::Ordering::Acquire) != self.clears || opened_in(first, last) {
+            return None;
+        }
+        Some(collect())
+    }
 }
 
 /// The asking of [`ask_aside`] stands on this thread while this lives.
@@ -430,11 +473,25 @@ pub(crate) fn ask_aside(ranges: &[(usize, usize)]) -> Option<Aside> {
         .filter(|r| r.0 < r.1)
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
-    pieces.retain(|&(first, _)| !known_view(first * PAGE));
-    if pieces.is_empty() {
+    // View memory: asked of the guards once below ([`views_once`]), else
+    // left to the order.
+    let mut views: Vec<(usize, usize)> = Vec::new();
+    let known = known_views(&pieces.iter().map(|p| p.0 * PAGE).collect::<Vec<_>>());
+    let mut k = known.iter();
+    pieces.retain(|&p| {
+        let view = *k.next().unwrap_or(&false);
+        if view && views_once() {
+            views.push(p);
+        }
+        !view
+    });
+    if pieces.is_empty() && views.is_empty() {
         return None;
     }
     pieces.sort_unstable();
+    // Before the guards are asked: what opens from here on is in `OPENED`
+    // while this count stands.
+    let clears = OPENED_CLEARS.load(std::sync::atomic::Ordering::Acquire);
     let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     let (kept, asked_before) = (std::mem::take(&mut j.ahead), j.ahead_asked);
@@ -464,6 +521,24 @@ pub(crate) fn ask_aside(ranges: &[(usize, usize)]) -> Option<Aside> {
     }
     let mut asked = std::mem::replace(&mut j.ahead, kept);
     j.ahead_asked = asked_before;
+    // The views, as `ask_views` does for the submission's asking.
+    views.sort_unstable();
+    let mut viewed: Vec<(usize, usize)> = Vec::with_capacity(views.len());
+    for (a, b) in views {
+        match viewed.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => viewed.push((a, b)),
+        }
+    }
+    viewed.retain(|&(first, last)| match guard(first * PAGE, last * PAGE) {
+        Some(written) => {
+            for page in written {
+                j.page_written(page, now);
+            }
+            true
+        }
+        None => false,
+    });
     drop(j);
     // In order, joined where they overlap ([`apart_holds`]).
     asked.sort_unstable();
@@ -474,17 +549,18 @@ pub(crate) fn ask_aside(ranges: &[(usize, usize)]) -> Option<Aside> {
             _ => apart.push((a, b)),
         }
     }
-    if apart.is_empty() {
+    if apart.is_empty() && viewed.is_empty() {
         return None;
     }
-    ASIDE.with(|a| *a.borrow_mut() = Some((now, apart)));
+    ASIDE.with(|a| *a.borrow_mut() = Some(AsideAsking { now, kernel: apart, views: viewed, clears }));
     Some(Aside)
 }
 
 /// Whether `[start, end)` lies inside the asking of [`ask_aside`] that
 /// stands on this thread.
 pub(crate) fn aside_holds(start: usize, end: usize) -> bool {
-    ASIDE.with(|a| a.borrow().as_ref().is_some_and(|(_, r)| apart_holds(r, start / PAGE, end.div_ceil(PAGE))))
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    ASIDE.with(|a| a.borrow().as_ref().is_some_and(|s| s.answer(first, last, true).is_some_and(|x| x.is_some())))
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -581,7 +657,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // `VICTORY_VIEWS_ONCE`: what is opened from here on is seen by the
     // refreshes answered from this asking (`ask_views` comes after).
     if views_once() {
-        OPENED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+        opened.clear();
+        OPENED_CLEARS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        drop(opened);
         OPENED_ANY.store(false, std::sync::atomic::Ordering::Release);
     }
     ask_once_end();
@@ -1203,9 +1282,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // A refresh made ahead, inside its asking ([`ask_aside`]).
-    if let Some(now) = ASIDE.with(|a| a.borrow().as_ref().and_then(|(n, r)| apart_holds(r, first, last).then_some(*n))) {
-        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
-        return Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+    if let Some(answer) = ASIDE.with(|a| a.borrow().as_ref().and_then(|s| s.answer(first, last, guarded))) {
+        return answer;
     }
     {
         let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
