@@ -4715,6 +4715,9 @@ mod tests {
         assert_eq!(heap.stride(1), Some(SKIP));
         heap.mirror(1, handles[1], true);
         assert_eq!(heap.stride(1), Some(16));
+        // So is a constant view left for later.
+        assert_eq!(heap.stride(2), Some(SKIP));
+        heap.mirror(2, handles[2], true);
         assert_eq!(heap.stride(2), Some(0));
         assert_eq!(heap.stride(3), Some(SKIP));
         // Slot 1's record names no view any more; a draw reads it.
