@@ -649,6 +649,71 @@ fn submission_us(i: usize, us: u64) {
 }
 
 /// Adds to [`PREPARING`]'s copies (time, bytes) and to the frame log's totals.
+/// Since the last frame line: the nanoseconds of a submission's preparing
+/// ([`Host::submit`], from its start to the lists sent, less its settles),
+/// slice by slice, so that they add up to it: the write watch asked ahead
+/// for the refreshes, the lists' steps by kind (title buffer copies, fills,
+/// refreshes queued, shader writes declared, textures, other), the
+/// refreshes' batch flushed, the asking's end, the snapshots, the card's
+/// work before the lists; and the whole (the last).
+static PREP_SPLIT: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+
+/// [`PREP_SPLIT`]'s slots.
+mod prep {
+    pub(super) const ASK: usize = 0;
+    /// Steps by kind: `STEPS + kind` ([`super::step_kind`]), six.
+    pub(super) const STEPS: usize = 1;
+    pub(super) const FLUSH: usize = 7;
+    pub(super) const ASK_END: usize = 8;
+    pub(super) const SNAPSHOTS: usize = 9;
+    pub(super) const CARD: usize = 10;
+    pub(super) const SETTLED: usize = 11;
+    pub(super) const WHOLE: usize = 12;
+}
+
+/// A step's kind for [`PREP_SPLIT`]: 0 a title buffer copy, 1 a fill, 2 a
+/// refresh queued, 3 a shader write declared, 4 a texture, 5 other.
+fn step_kind(step: &Step) -> usize {
+    match step {
+        Step::Copy(..) => 0,
+        Step::Fill(..) => 1,
+        Step::Refresh(..) => 2,
+        Step::GpuWrite(..) => 3,
+        Step::Texture(..) => 4,
+        _ => 5,
+    }
+}
+
+fn prep_add(slot: usize, d: std::time::Duration) {
+    PREP_SPLIT[slot].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// With the frame line: [`PREP_SPLIT`] per frame.
+fn prep_line(frames: f64) {
+    let s: Vec<f64> = PREP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    if s[prep::WHOLE] <= 0.0 {
+        return;
+    }
+    let sum: f64 = s[..prep::SETTLED].iter().sum();
+    tracing::info!(
+        "preparing per frame, in slices that add up ({:.1} ms; settles taken out, {:.1} ms): write watch asked ahead {:.1};          steps: buffer copies {:.1}, fills {:.1}, refreshes queued {:.1}, shader writes declared {:.1}, textures {:.1},          other {:.1}; refreshes flushed {:.1}; asking's end {:.1}; snapshots {:.1}; card before the lists {:.1};          left {:.1}",
+        s[prep::WHOLE],
+        s[prep::SETTLED],
+        s[prep::ASK],
+        s[prep::STEPS],
+        s[prep::STEPS + 1],
+        s[prep::STEPS + 2],
+        s[prep::STEPS + 3],
+        s[prep::STEPS + 4],
+        s[prep::STEPS + 5],
+        s[prep::FLUSH],
+        s[prep::ASK_END],
+        s[prep::SNAPSHOTS],
+        s[prep::CARD],
+        s[prep::WHOLE] - sum
+    );
+}
+
 fn preparing(i: usize, n: u64) {
     PREPARING[i].fetch_add(n, Ordering::Relaxed);
     crate::framelog::add([crate::framelog::T::CopyUs, crate::framelog::T::CopyBytes][i], n);
@@ -6575,6 +6640,17 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // The slices of [`PREP_SPLIT`]: from `mark` to now, less what was
+        // settled meanwhile.
+        let (mut mark, mut settled_at) = (started, settled);
+        let mut slice = |slot: usize, settled: std::time::Duration| {
+            let now = std::time::Instant::now();
+            // (`usize::MAX`: the clock starts again, nothing is added.)
+            if slot != usize::MAX {
+                prep_add(slot, (now - mark).saturating_sub(settled - settled_at));
+            }
+            (mark, settled_at) = (now, settled);
+        };
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -6608,6 +6684,7 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        slice(prep::ASK, settled);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -6616,8 +6693,12 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        // (The steps' slices are their own: `run_deferred`.)
+        slice(usize::MAX, settled);
         batch.flush();
+        slice(prep::FLUSH, settled);
         crate::watch::ask_once_end();
+        slice(prep::ASK_END, settled);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -6628,6 +6709,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        slice(prep::SNAPSHOTS, settled);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -6642,6 +6724,9 @@ impl Host {
             lists.push(Some(check));
         }
         let prepared = std::time::Instant::now();
+        slice(prep::CARD, settled);
+        prep_add(prep::SETTLED, settled);
+        prep_add(prep::WHOLE, (prepared - started).saturating_sub(settled));
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
@@ -8448,8 +8533,15 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        // Each step's time, by its kind, to the next step's start
+        // ([`PREP_SPLIT`]).
+        let mut open: Option<(usize, std::time::Instant)> = None;
+        let deferred = self.deferred();
+        for step in &deferred.copies {
             let started = std::time::Instant::now();
+            if let Some((kind, at)) = open.replace((step_kind(step), started)) {
+                prep_add(prep::STEPS + kind, started - at);
+            }
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8531,6 +8623,9 @@ impl HostList {
             };
             preparing(0, started.elapsed().as_micros() as u64);
             preparing(1, copied as u64);
+        }
+        if let Some((kind, at)) = open {
+            prep_add(prep::STEPS + kind, at.elapsed());
         }
     }
 }
@@ -9454,6 +9549,7 @@ impl Meter {
                 aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames
             );
         }
+        prep_line(frames);
         if crate::list::call_time_on() {
             let [calls, ns] = [0, 1].map(|i| crate::list::CALL_TIME[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
