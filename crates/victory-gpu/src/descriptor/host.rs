@@ -3625,7 +3625,18 @@ fn constant_view_size(size: u32) -> u32 {
         once!(size, "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)");
         return MOST;
     }
-    size.max(1).next_multiple_of(256)
+    // A view of no bytes stays one: a shader reads zeros through it, as on
+    // the console. Made 256 bytes (`size.max(1)`, from fork PR #911 on), it
+    // read 256 bytes of whatever lay at its address in the host copy, the
+    // ring of constants among them, which changes from frame to frame: a
+    // floor whose material binds such a view for a layer that is off
+    // flickered (Series S, the courtyard, from target95 on; the cap alone
+    // never acted in our runs).
+    if size == 0 {
+        once!(size, "a constant buffer view of no bytes, made of no bytes (read as zeros)");
+        return 0;
+    }
+    size.next_multiple_of(256)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -4128,6 +4139,8 @@ mod tests {
     /// most the host takes (a larger size removes the device on NVIDIA).
     #[test]
     fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(0), 0, "a view of no bytes stays one");
+        assert_eq!(constant_view_size(1), 256);
         assert_eq!(constant_view_size(16), 256);
         assert_eq!(constant_view_size(256), 256);
         assert_eq!(constant_view_size(65_536), 65_536);
