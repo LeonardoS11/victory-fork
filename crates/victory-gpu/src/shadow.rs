@@ -1569,6 +1569,93 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
+/// `VICTORY_REFRESH_SPLIT=<n>` (off by default; 0 or 1: off): the bytes a
+/// flush of refreshes copies from title memory go in `n` pieces of about
+/// equal size to the helper threads ([`wide`]), not one after another on
+/// the submitting thread. Which pages to copy is decided as before, on that
+/// thread, under each copy's own lock; only the copying moves.
+pub(crate) fn refresh_split() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // (Not with `VICTORY_REFRESH_CHECK=1`, whose look at the copy comes
+    // right after each refresh, before split bytes are in.)
+    *N.get_or_init(|| {
+        let check = std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1");
+        let n = std::env::var("VICTORY_REFRESH_SPLIT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        if check { 0 } else { n.min(64) }
+    })
+}
+
+thread_local! {
+    /// While a flush's copies are collected ([`refresh_split_begin`]): per
+    /// copy, (host address, title address, bytes, the copy, its offsets).
+    static SPLIT: std::cell::RefCell<Option<Vec<(usize, usize, usize, usize, usize, usize)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Since the last frame line, with [`refresh_split`]: flushes split,
+/// pieces run, bytes copied.
+pub(crate) static SPLIT_COUNT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// From now on this thread's [`Shadow::copy`] notes the bytes to copy and
+/// leaves them ([`refresh_split`]).
+pub(crate) fn refresh_split_begin() {
+    SPLIT.with(|s| *s.borrow_mut() = Some(Vec::new()));
+}
+
+/// The bytes noted since [`refresh_split_begin`] are copied, in
+/// [`refresh_split`] pieces on the helper threads; then, on this thread,
+/// each copy learns its bytes are in. The copies must be alive (the caller
+/// holds them).
+pub(crate) fn refresh_split_end() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(copies) = SPLIT.with(|s| s.borrow_mut().take()) else {
+        return;
+    };
+    if copies.is_empty() {
+        return;
+    }
+    let total: usize = copies.iter().map(|c| c.2).sum();
+    let parts = refresh_split().max(1);
+    let share = total.div_ceil(parts).max(64 << 10);
+    let mut jobs: Vec<Job> = Vec::new();
+    let mut group: Vec<(usize, usize, usize)> = Vec::new();
+    let mut bytes = 0;
+    for &(dst, src, len, ..) in &copies {
+        let mut at = 0;
+        while at < len {
+            let n = (share - bytes).min(len - at);
+            group.push((dst + at, src + at, n));
+            (at, bytes) = (at + n, bytes + n);
+            if bytes >= share {
+                let pieces = std::mem::take(&mut group);
+                jobs.push(Box::new(move || {
+                    for (dst, src, n) in pieces {
+                        crate::host::copy_mapped(dst as *mut u8, src as *const u8, n, false);
+                    }
+                }));
+                bytes = 0;
+            }
+        }
+    }
+    if !group.is_empty() {
+        jobs.push(Box::new(move || {
+            for (dst, src, n) in group {
+                crate::host::copy_mapped(dst as *mut u8, src as *const u8, n, false);
+            }
+        }));
+    }
+    SPLIT_COUNT[0].fetch_add(1, Relaxed);
+    SPLIT_COUNT[1].fetch_add(jobs.len() as u64, Relaxed);
+    SPLIT_COUNT[2].fetch_add(total as u64, Relaxed);
+    wide(jobs);
+    for (_, _, _, shadow, a, e) in copies {
+        // SAFETY: the caller holds every copy noted.
+        let shadow = unsafe { &*(shadow as *const Shadow) };
+        shadow.changed(a, e);
+        shadow.card_changed(a, e);
+    }
+}
+
 /// With [`wide_back`]: the snapshots noted while a submission is prepared
 /// (from, to, bytes), taken by [`take_snapshots`].
 static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
@@ -4011,6 +4098,18 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        // `VICTORY_REFRESH_SPLIT`: the bytes are copied later, beside other
+        // threads, and what follows the copy then ([`refresh_split_end`]).
+        if from < to
+            && SPLIT.with(|s| {
+                s.borrow_mut()
+                    .as_mut()
+                    .map(|copies| copies.push((at as usize, from, to - from, std::ptr::from_ref(self) as usize, from - start, to - start)))
+                    .is_some()
+            })
+        {
+            return to - from;
+        }
         #[cfg(feature = "diagnostics")]
         if from < to {
             crate::copystat::pages_copied(from, to);

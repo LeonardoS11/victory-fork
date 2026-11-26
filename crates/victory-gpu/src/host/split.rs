@@ -77,6 +77,15 @@ pub(super) fn flush_line(frames: f64) {
         s[4] / 1e6,
         s[6] / 1e6
     );
+    if crate::shadow::refresh_split() > 1 {
+        let [flushes, pieces, bytes] =
+            [0, 1, 2].map(|i| crate::shadow::SPLIT_COUNT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "refreshes' copies split (VICTORY_REFRESH_SPLIT={}), per frame: {flushes:.0} flushes in {pieces:.0} pieces, {:.1} MB",
+            crate::shadow::refresh_split(),
+            bytes / 1e6
+        );
+    }
     if flush_overlap() {
         let [none, left] = [0, 1].map(|i| OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(

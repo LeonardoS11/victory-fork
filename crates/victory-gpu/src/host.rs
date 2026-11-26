@@ -9162,10 +9162,23 @@ impl Batch {
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
+            let split = crate::shadow::refresh_split() > 1 && self.refreshes.len() > 1;
+            if split {
+                crate::shadow::refresh_split_begin();
+            }
+            // (Held until their bytes are in.)
+            let mut held = Vec::with_capacity(if split { self.refreshes.len() } else { 0 });
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
                 Self::brought(&mut self.current, &shadow, from, to);
+                if split {
+                    held.push(shadow);
+                }
             }
+            if split {
+                crate::shadow::refresh_split_end();
+            }
+            drop(held);
         }
         if ahead {
             crate::watch::ask_ahead_done();
