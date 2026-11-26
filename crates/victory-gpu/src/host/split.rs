@@ -175,9 +175,7 @@ impl Batch {
             self.flush();
             return;
         }
-        let (touching, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refreshes)
-            .into_iter()
-            .partition(|r| r.1 < end && at < r.2);
+        let (touching, rest) = touching(std::mem::take(&mut self.refreshes), at, end);
         OVERLAP[1].fetch_add(rest.len() as u64, Ordering::Relaxed);
         if touching.is_empty() {
             OVERLAP[0].fetch_add(1, Ordering::Relaxed);
@@ -191,5 +189,39 @@ impl Batch {
         for (at, r) in self.refreshes.iter().enumerate() {
             self.index.insert(std::sync::Arc::as_ptr(&r.0) as usize, at);
         }
+    }
+}
+
+/// Pending refreshes `(copy, from, to)` split into those whose range
+/// touches `[at, end)` and the others, each in the order given
+/// ([`Batch::flush_before_copy`]).
+fn touching<T>(refreshes: Vec<(T, usize, usize)>, at: usize, end: usize) -> (Vec<(T, usize, usize)>, Vec<(T, usize, usize)>) {
+    refreshes.into_iter().partition(|r| r.1 < end && at < r.2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::touching;
+
+    /// A refresh touches a copy's bytes if their ranges share a byte: one
+    /// that ends where the copy begins, or begins where it ends, does not;
+    /// one inside, around or over either end does. Order is kept.
+    #[test]
+    fn only_refreshes_sharing_a_byte_with_the_copy_are_flushed() {
+        let pending = vec![
+            ('a', 0x1000, 0x2000), // ends where the copy begins
+            ('b', 0x1800, 0x2400), // over its start
+            ('c', 0x2100, 0x2200), // inside
+            ('d', 0x1000, 0x9000), // around
+            ('e', 0x2f00, 0x3100), // over its end
+            ('f', 0x3000, 0x4000), // begins where it ends
+            ('g', 0x8000, 0x9000), // far
+        ];
+        let (flushed, left) = touching(pending, 0x2000, 0x3000);
+        assert_eq!(flushed.iter().map(|r| r.0).collect::<String>(), "bcde");
+        assert_eq!(left.iter().map(|r| r.0).collect::<String>(), "afg");
+        let (flushed, left) = touching(vec![((), 0x1000, 0x2000)], 0x5000, 0x5000);
+        assert!(flushed.is_empty(), "an empty copy touches nothing");
+        assert_eq!(left.len(), 1);
     }
 }

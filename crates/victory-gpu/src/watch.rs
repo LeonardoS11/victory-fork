@@ -129,11 +129,7 @@ static OPENED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// submission did not see ([`OPENED`]).
 fn opened(first: usize, last: usize) {
     if first < last && views_once() {
-        let mut o = OPENED.lock().unwrap_or_else(|e| e.into_inner());
-        match o.last_mut() {
-            Some(l) if l.0 <= last && first <= l.1 => *l = (l.0.min(first), l.1.max(last)),
-            _ => o.push((first, last)),
-        }
+        note_opened(&mut OPENED.lock().unwrap_or_else(|e| e.into_inner()), first, last);
         OPENED_ANY.store(true, std::sync::atomic::Ordering::Release);
     }
 }
@@ -141,7 +137,24 @@ fn opened(first: usize, last: usize) {
 /// Whether a block of `[first, last)` is in [`OPENED`].
 fn opened_in(first: usize, last: usize) -> bool {
     OPENED_ANY.load(std::sync::atomic::Ordering::Acquire)
-        && OPENED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a < last && first < b)
+        && any_opened(&OPENED.lock().unwrap_or_else(|e| e.into_inner()), first, last)
+}
+
+/// Blocks `[first, last)` added to `opened`: joined with the last range if
+/// they overlap or touch it (the faults of one write come together).
+fn note_opened(opened: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    match opened.last_mut() {
+        Some(l) if l.0 <= last && first <= l.1 => *l = (l.0.min(first), l.1.max(last)),
+        _ => opened.push((first, last)),
+    }
+}
+
+/// Whether a block of `[first, last)` is in one of `opened`.
+fn any_opened(opened: &[(usize, usize)], first: usize, last: usize) -> bool {
+    opened.iter().any(|&(a, b)| a < last && first < b)
 }
 
 /// Since the last frame line, with [`views_once`]: view ranges asked of the
@@ -632,6 +645,27 @@ fn reservation_of(page: usize) -> Option<(usize, usize)> {
 /// ranges, sorted) grouped by the reservation they lie in, one asking over
 /// each group's span (at most [`AHEAD_MAX`] pages a call). Pieces in no
 /// reservation, or whose asking fails, are left to [`writes`].
+/// The span one asking of [`ask_by_reservation`] covers, from piece `i`
+/// (page ranges, sorted) in the reservation `[r_first, r_end)`: its first
+/// and last page and the piece after it. The pieces that follow are taken
+/// while they begin in the reservation and, with a `gap` (pages; 0: none),
+/// no more than `gap` past the span so far. A piece is cut at the
+/// reservation's end.
+///
+/// `VICTORY_RESERVATION_GAP=<MiB>`: the kernel walks the page tables of all
+/// it is asked about; 46 askings over whole spans of reservations were
+/// 19-20 ms a frame of the submitting thread (Series S, run M3).
+fn reservation_run(pieces: &[(usize, usize)], i: usize, (r_first, r_end): (usize, usize), gap: usize) -> (usize, usize, usize) {
+    let first = pieces[i].0;
+    let mut last = pieces[i].1.min(r_end);
+    let mut k = i + 1;
+    while k < pieces.len() && pieces[k].0 < r_end && pieces[k].0 >= r_first && (gap == 0 || pieces[k].0 <= last + gap) {
+        last = last.max(pieces[k].1.min(r_end));
+        k += 1;
+    }
+    (first, last, k)
+}
+
 /// [`ask_by_reservation`]'s largest gap inside one asking, in pages
 /// (`VICTORY_RESERVATION_GAP=<MiB>`, 8 by default as [`AHEAD_GAP`]; 0:
 /// none, every range of a reservation in one asking as before).
@@ -660,23 +694,7 @@ fn ask_by_reservation(j: &mut Journal, pieces: &[(usize, usize)]) {
             i += 1;
             continue;
         };
-        let first = pieces[i].0;
-        let mut last = pieces[i].1.min(r_end);
-        let mut k = i + 1;
-        // `VICTORY_RESERVATION_GAP=<MiB>` (8 by default; 0: none): the span
-        // ends where the next range lies that far past it, and the next
-        // asking begins there. The kernel walks the page tables of all it
-        // is asked about: 46 askings over whole spans of reservations were
-        // 19-20 ms a frame of the submitting thread (Series S, run M3).
-        let gap = reservation_gap();
-        while k < pieces.len()
-            && pieces[k].0 < r_end
-            && pieces[k].0 >= r_first
-            && (gap == 0 || pieces[k].0 <= last + gap)
-        {
-            last = last.max(pieces[k].1.min(r_end));
-            k += 1;
-        }
+        let (first, last, k) = reservation_run(pieces, i, (r_first, r_end), reservation_gap());
         let mut from = first;
         while from < last {
             let to = last.min(from + AHEAD_MAX);
@@ -3784,5 +3802,48 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod v12c_tests {
+    use super::{any_opened, note_opened, reservation_run};
+
+    /// `VICTORY_VIEWS_ONCE`: what was opened is kept as ranges, joined when
+    /// they touch, and a refresh is sent to the guards exactly when its
+    /// range shares a block with one of them.
+    #[test]
+    fn opened_blocks_are_found_by_any_range_that_shares_one() {
+        let mut opened = Vec::new();
+        note_opened(&mut opened, 10, 12);
+        note_opened(&mut opened, 12, 14); // touches: joined
+        note_opened(&mut opened, 13, 13); // empty: nothing
+        note_opened(&mut opened, 100, 101);
+        note_opened(&mut opened, 1 << 20, (1 << 20) + 50_000); // a big remap, whole
+        assert_eq!(opened, [(10, 14), (100, 101), (1 << 20, (1 << 20) + 50_000)]);
+        assert!(any_opened(&opened, 13, 20));
+        assert!(any_opened(&opened, 0, 11));
+        assert!(!any_opened(&opened, 14, 100), "ends where one begins, begins where one ends");
+        assert!(any_opened(&opened, (1 << 20) + 49_999, (1 << 20) + 60_000), "the last block of a big one");
+        assert!(!any_opened(&[], 0, usize::MAX));
+    }
+
+    /// `VICTORY_RESERVATION_GAP`: pieces close together are one asking, a
+    /// gap larger than the bound starts another, and an asking never goes
+    /// past its reservation; with no bound the reservation's pieces are one.
+    #[test]
+    fn an_asking_by_reservation_ends_at_a_wide_gap_and_at_the_reservation() {
+        let r = (1000, 2000);
+        let pieces = [(1000, 1010), (1012, 1020), (1100, 1110), (1115, 1990), (1995, 2100), (2050, 2060)];
+        // Gap of 8: 1012 is 2 past 1010, joined; 1100 is 80 past 1020, apart.
+        assert_eq!(reservation_run(&pieces, 0, r, 8), (1000, 1020, 2));
+        assert_eq!(reservation_run(&pieces, 2, r, 8), (1100, 2000, 5), "cut at the reservation's end");
+        // 2050 lies past the reservation: never in its asking.
+        assert_eq!(reservation_run(&pieces, 5, (2000, 3000), 8), (2050, 2060, 6));
+        // No bound: every piece of the reservation, as before.
+        assert_eq!(reservation_run(&pieces, 0, r, 0), (1000, 2000, 5));
+        // A gap exactly at the bound joins.
+        assert_eq!(reservation_run(&[(0, 4), (12, 16)], 0, (0, 100), 8), (0, 16, 2));
+        assert_eq!(reservation_run(&[(0, 4), (13, 16)], 0, (0, 100), 8), (0, 4, 1));
     }
 }
