@@ -4473,9 +4473,37 @@ struct Entry {
 /// waiting for it in `lookup` was 6% of a recording thread's samples).
 static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
-    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> Changing<BTreeMap<(u64, usize), Entry>> {
+    MAPS_CHANGED.fetch_add(1, Ordering::Release);
+    Changing(BUFFERS.write().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// A table taken exclusive: [`MAPS_CHANGED`] is bumped when it is taken
+/// and again when it is let go, so a thread that read the count on either
+/// side of a change and the table before it holds an answer of a count
+/// that is no longer the count (fork pull request #1245, upstream bc6ee68:
+/// a count bumped only before the change let such an answer stand).
+pub(crate) struct Changing<T: 'static>(std::sync::RwLockWriteGuard<'static, T>);
+
+impl<T> std::ops::Deref for Changing<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Changing<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T> Drop for Changing<T> {
+    fn drop(&mut self) {
+        // (Before the lock is let go: a thread that takes it shared after
+        // reads the count after this.)
+        MAPS_CHANGED.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// Bumped whenever the maps [`find`] and [`exact`] answer from may change
@@ -4707,10 +4735,11 @@ pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// found, weakly (a copy nothing else holds can still be let go), for as
 /// long as the tables have not changed ([`MAPS_CHANGED`]).
 /// With it, `VICTORY_SHADOW_CACHE` (fork PR #1224) is not taken as well:
-/// the two are not stacked.
+/// the two are not stacked. Off by default (`VICTORY_LOOKUP_CACHE=1`), as
+/// upstream has it since bc6ee68.
 fn found_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOKUP_CACHE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOKUP_CACHE").is_some_and(|v| v == "1"))
 }
 
 /// The most asks a thread remembers before it starts again.
@@ -5014,9 +5043,9 @@ static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::
 
 /// [`LOOSE`] exclusive; [`MAPS_CHANGED`] bumped, as [`buffers`] does (the
 /// answers threads remember, fork PRs #1224 and #1237).
-fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Arc<Shadow>>> {
-    MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
-    LOOSE.write().unwrap_or_else(|e| e.into_inner())
+fn loose_write() -> Changing<BTreeMap<(u64, u64), Arc<Shadow>>> {
+    MAPS_CHANGED.fetch_add(1, Ordering::Release);
+    Changing(LOOSE.write().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
