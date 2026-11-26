@@ -263,8 +263,10 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// reset), 4 the pages it found noted, 5 reservations looked up
 /// ([`reservation_of`]), 6 holes looked at again, 7 the look for title
 /// bytes under flights (`stale_under_flights`, its settles not counted);
-/// then counts: 8 kernel askings, 9 pages they found, 10 ranges asked.
-pub(crate) static ASK_SPLIT: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+/// then counts: 8 kernel askings, 9 pages they found, 10 ranges asked;
+/// then 11 the guards asked about the views ([`ask_views`], nanoseconds),
+/// 12 the ranges they were asked about.
+pub(crate) static ASK_SPLIT: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
 
 /// Adds the time since `since` to part `i` of [`ASK_SPLIT`].
 pub(crate) fn ask_split(i: usize, since: std::time::Instant) {
@@ -339,7 +341,7 @@ pub(crate) fn ask_split_line(frames: f64) {
         "the write watch asked ahead, by part, ms per frame: spans gathered {:.2}, journal lock waited {:.2}, view memory \
          looked up {:.2}, kernel asked (GetWriteWatch with reset) {:.2} in {:.0} askings over {:.0} ranges finding {:.0} \
          pages, pages noted {:.2}, reservations looked up {:.2}, holes looked at {:.2}, title bytes under flights looked \
-         for {:.2}",
+         for {:.2}; the guards asked about view memory (VICTORY_VIEWS_ONCE) {:.2} in {:.0} joined ranges",
         ms(0),
         ms(1),
         ms(2),
@@ -350,7 +352,9 @@ pub(crate) fn ask_split_line(frames: f64) {
         ms(4),
         ms(5),
         ms(6),
-        ms(7)
+        ms(7),
+        ms(11),
+        s[12] / frames
     );
 }
 
@@ -757,8 +761,9 @@ fn ask_views(j: &mut Journal, mut views: Vec<(usize, usize)>) {
         }
         j.ahead_views.push((first, last));
         VIEWS_ONCE[0].fetch_add(1, Relaxed);
+        ASK_SPLIT[12].fetch_add(1, Relaxed);
     }
-    ask_split(2, looking);
+    ask_split(11, looking);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
