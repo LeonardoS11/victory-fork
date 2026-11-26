@@ -10,14 +10,17 @@
 //! the in-order refresh finds little left and loses nothing.
 //!
 //! The one rule: nothing is refreshed ahead that a list being prepared
-//! (its preparing began, it was not sent yet) reads or has shaders write
-//! (its `Refresh`, `GpuWrite` and `Texture` steps): its lists must read
-//! those bytes as its own preparing leaves them, not as a later
-//! submission's. A list not being prepared yet has its refreshes made in
-//! order after any made ahead, which then find only what changed since.
-//! `Host::submit` marks its lists as being prepared and then waits for
-//! every refresh ahead given before that mark, which did not know it, so
-//! that none runs beside the preparing of a list it could disturb.
+//! (its preparing began, it was not sent yet) may write after its own
+//! refreshes: its title buffer copies' destinations, the ranges its
+//! shaders may write, and, if it has a step that writes title memory
+//! nobody knows where (`Run`), everything it refreshes. Its lists must
+//! read those bytes as its own preparing leaves them. What it only reads
+//! is refreshed ahead freely: title memory there is what it was when the
+//! list refreshed it (the title gave the frame over and stands still). A
+//! list not being prepared yet has its refreshes made in order after any
+//! made ahead, which then find only what changed since. `Host::submit`
+//! marks its lists as being prepared and then waits for every refresh
+//! ahead given before that mark, which did not know it.
 
 use super::*;
 
@@ -44,22 +47,37 @@ thread_local! {
     pub(super) static HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// What a submission given and not sent holds, by list ([`given`]).
+/// What a list given and not sent may write of title memory, as far as a
+/// refresh ahead is concerned ([`given`]).
+#[derive(Default)]
+struct Marks {
+    /// Title memory its steps write (`Copy` destinations) and its shaders
+    /// may write (`GpuWrite`).
+    writes: Vec<(usize, usize)>,
+    /// Title memory it refreshes (`Refresh`, `Texture`).
+    reads: Vec<(usize, usize)>,
+    /// It has a `Run` step, which writes title memory nobody knows where:
+    /// what it reads counts as written.
+    run: bool,
+}
+
+/// The lists given and not sent ([`given`]).
 #[derive(Default)]
 struct Table {
     /// The last list's number.
     seq: u64,
-    /// Per host copy (its address): ranges read or written by shaders, with
-    /// the number of the list that holds them.
-    shadows: std::collections::HashMap<usize, Vec<(usize, usize, u64)>>,
-    /// Per staging buffer: the lists that refresh it.
-    stagings: std::collections::HashMap<usize, Vec<u64>>,
+    /// Per list number: what it may write.
+    marks: std::collections::HashMap<u64, Marks>,
+    /// What the lists being prepared may write (their `writes`, and their
+    /// `reads` too where they have a `Run`), in order and joined: a refresh
+    /// ahead touching it is left to the order.
+    blocked: Vec<(usize, usize)>,
     /// Host list (its command list's address) -> its number.
     lists: std::collections::HashMap<usize, u64>,
     /// Numbers of lists whose refreshes ahead are not done.
     pending: std::collections::BTreeSet<u64>,
     /// Numbers of lists whose preparing in order began ([`wait`]) and that
-    /// were not sent yet: what they hold is not refreshed ahead.
+    /// were not sent yet: what they may write is not refreshed ahead.
     started: std::collections::HashSet<u64>,
     /// Since the last line ([`S_LISTS`]..).
     stats: [u64; 10],
@@ -70,6 +88,21 @@ static DONE: std::sync::Condvar = std::sync::Condvar::new();
 
 fn table() -> std::sync::MutexGuard<'static, Table> {
     TABLE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Table {
+    /// [`Table::blocked`] made again from the lists being prepared.
+    fn block(&mut self) {
+        self.blocked.clear();
+        for s in &self.started {
+            if let Some(m) = self.marks.get(s) {
+                join_ranges(&mut self.blocked, m.writes.iter().copied());
+                if m.run {
+                    join_ranges(&mut self.blocked, m.reads.iter().copied());
+                }
+            }
+        }
+    }
 }
 
 // [`Table::stats`]' places: lists given, refreshes and textures, made
@@ -129,37 +162,33 @@ pub(crate) fn given(lists: &[crate::object::This]) {
         let seq = t.seq;
         t.lists.insert(key(list), seq);
         t.stats[S_LISTS] += 1;
-        let started = &t.started;
+        let mut marks = Marks::default();
         for step in &list.deferred().copies {
             match step {
-                Step::Refresh(shadow, at, len) | Step::GpuWrite(shadow, at, len) => {
+                &Step::Copy(dst, _, len) => marks.writes.push((dst, dst + len)),
+                Step::Run(_) => marks.run = true,
+                Step::GpuWrite(_, at, len) => marks.writes.push((*at, *at + *len)),
+                Step::Refresh(shadow, at, len) => {
                     let (from, to) = (*at, *at + *len);
-                    let at = std::sync::Arc::as_ptr(shadow) as usize;
-                    let ranges = t.shadows.entry(at).or_default();
-                    let held = ranges.iter().any(|&(a, b, s)| started.contains(&s) && a < to && from < b);
-                    ranges.push((from, to, seq));
-                    if let Step::Refresh(..) = step {
-                        t.stats[S_ITEMS] += 1;
-                        if held {
-                            t.stats[S_HELD] += 1;
-                        } else if shadow.unwatched() {
-                            t.stats[S_UNWATCHED] += 1;
-                        } else if !queued.insert((at, from, to)) {
-                            t.stats[S_TWICE] += 1;
-                        } else {
-                            job.items.push(Item::Refresh(shadow.clone(), from, to));
-                        }
+                    marks.reads.push((from, to));
+                    t.stats[S_ITEMS] += 1;
+                    if touches(&t.blocked, from, to) {
+                        t.stats[S_HELD] += 1;
+                    } else if shadow.unwatched() {
+                        t.stats[S_UNWATCHED] += 1;
+                    } else if !queued.insert((std::sync::Arc::as_ptr(shadow) as usize, from, to)) {
+                        t.stats[S_TWICE] += 1;
+                    } else {
+                        job.items.push(Item::Refresh(shadow.clone(), from, to));
                     }
                 }
                 Step::Texture(staging) => {
-                    let at = std::sync::Arc::as_ptr(staging) as usize;
-                    let lists = t.stagings.entry(at).or_default();
-                    let held = lists.iter().any(|s| started.contains(s));
-                    lists.push(seq);
+                    let (at, len) = staging.memory();
+                    marks.reads.push((at, at + len));
                     t.stats[S_ITEMS] += 1;
-                    if held {
+                    if touches(&t.blocked, at, at + len) {
                         t.stats[S_HELD] += 1;
-                    } else if !queued.insert((at, 0, 0)) {
+                    } else if !queued.insert((std::sync::Arc::as_ptr(staging) as usize, 0, 0)) {
                         t.stats[S_TWICE] += 1;
                     } else {
                         job.items.push(Item::Texture(staging.clone()));
@@ -168,6 +197,7 @@ pub(crate) fn given(lists: &[crate::object::This]) {
                 _ => {}
             }
         }
+        t.marks.insert(seq, marks);
         job.seqs.push(seq);
     }
     if job.items.is_empty() {
@@ -248,7 +278,10 @@ pub(crate) fn wait(runs: &[&HostList]) {
     }
     let mut t = table();
     let seqs: Vec<u64> = runs.iter().filter_map(|r| t.lists.get(&key(r)).copied()).collect();
-    t.started.extend(seqs);
+    if !seqs.is_empty() {
+        t.started.extend(seqs);
+        t.block();
+    }
     let mark = t.seq;
     if t.pending.first().is_none_or(|&s| s > mark) {
         return;
@@ -275,15 +308,9 @@ pub(crate) fn sent(runs: &[&HostList]) {
     }
     for s in &seqs {
         t.started.remove(s);
+        t.marks.remove(s);
     }
-    t.shadows.retain(|_, ranges| {
-        ranges.retain(|r| !seqs.contains(&r.2));
-        !ranges.is_empty()
-    });
-    t.stagings.retain(|_, lists| {
-        lists.retain(|s| !seqs.contains(s));
-        !lists.is_empty()
-    });
+    t.block();
 }
 
 /// With the frame line.
@@ -294,7 +321,7 @@ pub(crate) fn line(frames: f64) {
     let s = std::mem::take(&mut table().stats).map(|v| v as f64 / frames);
     tracing::info!(
         "refreshes ahead across submissions (VICTORY_PREWARM), per frame: {:.0} lists given, {:.0} refreshes and textures, \
-         {:.0} made ahead; left to the order: {:.0} held by a list being prepared, {:.0} of copies not write-watched, \
+         {:.0} made ahead; left to the order: {:.0} touching what a list being prepared may write, {:.0} of copies not write-watched, \
          {:.0} outside the asking aside (view memory and such), {:.0} the same item twice in one hand-over; {:.2} ms on \
          the helpers; Host::submit waited {:.2} ms in {:.1} waits",
         s[S_LISTS],
