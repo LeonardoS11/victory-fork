@@ -1423,9 +1423,14 @@ impl Staging {
         for &(run_start, run_len) in &runs {
             let mut buf = vec![0u8; run_len];
             crate::host::copy_mapped(buf.as_mut_ptr(), run_start as *const u8, run_len, false);
+            // `ranges` are offsets in the texture's memory and the run is at
+            // a title address: compared in the texture's offsets (until
+            // 2026-11-26 they were compared as they were, never met, and no
+            // page was detiled while the texture was taken for refreshed).
+            let run_at = (run_start - start) as u64;
             for (sub, &(rs, re)) in ranges.iter().enumerate() {
-                let a = rs.max(run_start as u64);
-                let b = re.min((run_start + run_len) as u64);
+                let a = rs.max(run_at);
+                let b = re.min(run_at + run_len as u64);
                 if a >= b {
                     continue;
                 }
@@ -1439,7 +1444,7 @@ impl Staging {
                 let linear = unsafe {
                     std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
                 };
-                let win_bytes = &buf[(a as usize - run_start)..(b as usize - run_start)];
+                let win_bytes = &buf[(a - run_at) as usize..(b - run_at) as usize];
                 if let Err(e) =
                     self.layout
                         .detile_window(win_bytes, a, mip, slice, linear, pitch, pitch * rows)
