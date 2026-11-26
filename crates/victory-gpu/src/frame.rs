@@ -106,6 +106,7 @@ pub(crate) static PACE_FREED: AtomicU64 = AtomicU64::new(0);
 static PRESENTS: std::sync::Mutex<(Option<Instant>, u64)> = std::sync::Mutex::new((None, 0));
 
 fn note_present() {
+    crate::critical::frame_end();
     let mut p = PRESENTS.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
     if let Some(before) = p.0 {

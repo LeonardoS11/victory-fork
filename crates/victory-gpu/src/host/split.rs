@@ -124,6 +124,7 @@ pub(super) fn prep_line(frames: f64) {
 /// With the frame line, with `VICTORY_LIST_CALL_TIME=1`: the title's
 /// threads inside our list calls, and the methods that took most.
 pub(super) fn list_calls_line(frames: f64) {
+    crate::critical::line();
     if crate::list::call_time_on() {
         let [calls, ns] = [0, 1].map(|i| crate::list::CALL_TIME[i].swap(0, Ordering::Relaxed) as f64 / frames);
         let mut by: Vec<(f64, f64, &str)> = crate::list::CALL_BY

@@ -2212,6 +2212,7 @@ impl Drop for CallTimer {
                 calls.fetch_add(1, Relaxed);
                 spent.fetch_add(ns, Relaxed);
             }
+            crate::critical::list_call(ns);
         }
     }
 }

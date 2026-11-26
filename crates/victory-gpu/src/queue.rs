@@ -1133,6 +1133,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     #[cfg(windows)]
     {
         let us = started.elapsed().as_micros() as u64;
+        crate::critical::execute(started.elapsed().as_nanos() as u64);
         crate::framelog::add(crate::framelog::T::ExecuteUs, us);
         crate::framelog::here(crate::framelog::H::ExecuteUs, us);
     }
@@ -1398,6 +1399,7 @@ extern "system" fn present(
     #[cfg(windows)]
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
+        crate::critical::present(presenting.elapsed().as_nanos() as u64);
         crate::framelog::frame();
         #[cfg(feature = "diagnostics")]
         crate::fence::pace::frame();
