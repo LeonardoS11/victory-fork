@@ -4614,7 +4614,10 @@ mod tests {
         let mut record = [0u32; 8];
         let handle = record.as_mut_ptr() as u64;
         crate::descriptor::record(handle, placed_buffer(16));
-        heap.mirror(1, handle, false);
+        // Made, as a draw or the pass over buffer views makes it (ours: a
+        // slot null since the heap was made and left for later is not
+        // made a null buffer view, so its entry stays skipped till then).
+        heap.mirror(1, handle, true);
         assert_eq!(heap.stride(1), Some(16));
         let wider = placed_buffer(32);
         assert!(heap.note_buffer(1, Some(&wider), false).is_empty());
@@ -4650,6 +4653,12 @@ mod tests {
             crate::descriptor::record(handles[slot], view);
             heap.mirror(slot as u32, handles[slot], false);
         }
+        // Ours: a buffer view left for later in a slot null since the heap
+        // was made holds no null buffer view (fork #1043 leaves the slot as
+        // `fill_null` made it, a null 2D view), so its entry stays skipped
+        // until a draw or the pass over buffer views makes it.
+        assert_eq!(heap.stride(1), Some(SKIP));
+        heap.mirror(1, handles[1], true);
         assert_eq!(heap.stride(1), Some(16));
         assert_eq!(heap.stride(2), Some(0));
         assert_eq!(heap.stride(3), Some(SKIP));
