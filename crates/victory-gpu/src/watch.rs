@@ -82,6 +82,11 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// With [`views_once`]: ranges of view memory (blocks) the guards were
+    /// asked about for the submission ([`ask_once`]); `writes` answers a
+    /// range inside one from the journal while no block of it was opened
+    /// since ([`OPENED`]).
+    ahead_views: Vec<(usize, usize)>,
 }
 
 /// 4 KiB pieces in a page.
@@ -95,7 +100,55 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    ahead_views: Vec::new(),
 });
+
+/// Whether a submission's view memory is asked of the guards once, with its
+/// kernel asking ([`ask_once`]), and each refresh of it then answered from
+/// the journal (`VICTORY_VIEWS_ONCE=1`; off by default: the guards are
+/// asked at every refresh of view memory, as before).
+///
+/// Exact: a refresh is answered so only if no block of its range was opened
+/// since that asking ([`OPENED`]: a write of the title's or ours, the
+/// runtime mapping or committing memory there). Otherwise it goes to the
+/// guards as before, and the blocks found so are counted: those are the
+/// writes between the asking and the refresh that the old way saw and an
+/// answer from the asking would have seen a submission late.
+pub(crate) fn views_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| once() && std::env::var_os("VICTORY_VIEWS_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// With [`views_once`]: ranges of blocks of view memory opened (or
+/// mapped, or committed) since the submission's asking; and whether there
+/// are any (read without the lock).
+static OPENED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+static OPENED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Blocks `[first, last)` changed in a way the guards' asking for the
+/// submission did not see ([`OPENED`]).
+fn opened(first: usize, last: usize) {
+    if first < last && views_once() {
+        let mut o = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+        match o.last_mut() {
+            Some(l) if l.0 <= last && first <= l.1 => *l = (l.0.min(first), l.1.max(last)),
+            _ => o.push((first, last)),
+        }
+        OPENED_ANY.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether a block of `[first, last)` is in [`OPENED`].
+fn opened_in(first: usize, last: usize) -> bool {
+    OPENED_ANY.load(std::sync::atomic::Ordering::Acquire)
+        && OPENED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, b)| a < last && first < b)
+}
+
+/// Since the last frame line, with [`views_once`]: view ranges asked of the
+/// guards with the submission's asking; refreshes of view memory answered
+/// from the journal; refreshes that went to the guards because a block of
+/// theirs was opened since; and the pages those found written.
+pub(crate) static VIEWS_ONCE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 impl Journal {
     /// Page `page` written whole at asking `now`.
@@ -177,6 +230,16 @@ fn known_view_timed(start: usize) -> bool {
 /// With the frame line: [`ASK_SPLIT`] per frame.
 pub(crate) fn ask_split_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
+    if views_once() {
+        let v: Vec<f64> = VIEWS_ONCE.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "view memory asked of the guards once a submission (VICTORY_VIEWS_ONCE=1), per frame: {:.0} ranges asked so;              {:.0} refreshes answered from the journal, {:.0} sent to the guards because a block of theirs was opened              since, finding {:.0} pages written (a submission late without the check)",
+            v[0],
+            v[1],
+            v[2],
+            v[3]
+        );
+    }
     let s: Vec<f64> = ASK_SPLIT.iter().map(|n| n.swap(0, Relaxed) as f64).collect();
     if s[8] == 0.0 && s[0] == 0.0 {
         return;
@@ -332,10 +395,17 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         ask_split(6, looking);
     }
     ASK_SPLIT[10].fetch_add(ranges.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    // `VICTORY_VIEWS_ONCE`: what is opened from here on is seen by the
+    // refreshes answered from this asking (`ask_views` comes after).
+    if views_once() {
+        OPENED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        OPENED_ANY.store(false, std::sync::atomic::Ordering::Release);
+    }
     ask_once_end();
     ask_ahead(ranges);
     let mut j = journal_timed();
     let j = &mut *j;
+    let mut views: Vec<(usize, usize)> = Vec::new();
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
         j.asked += 1;
@@ -357,6 +427,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         if known_view_timed(start) {
             #[cfg(feature = "diagnostics")]
             AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if views_once() {
+                views.push((start / PAGE, end.div_ceil(PAGE)));
+            }
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -364,7 +437,40 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             j.ahead.push((first, last));
         }
     }
-    j.kept = !j.ahead.is_empty();
+    if !views.is_empty() {
+        ask_views(j, views);
+    }
+    j.kept = !j.ahead.is_empty() || !j.ahead_views.is_empty();
+}
+
+/// [`views_once`]: the guards asked once about `views` (page ranges of view
+/// memory), joined where they touch; what they find written is noted in
+/// the journal at the submission's asking, and the ranges stand for its
+/// refreshes. [`OPENED`] was emptied before ([`ask_once`]), so a block
+/// opened while or after they are asked is in it.
+fn ask_views(j: &mut Journal, mut views: Vec<(usize, usize)>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let looking = std::time::Instant::now();
+    views.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(views.len());
+    for (a, b) in views {
+        match joined.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => joined.push((a, b)),
+        }
+    }
+    let now = j.ahead_asked;
+    for (first, last) in joined {
+        let Some(written) = guard(first * PAGE, last * PAGE) else {
+            continue;
+        };
+        for page in written {
+            j.page_written(page, now);
+        }
+        j.ahead_views.push((first, last));
+        VIEWS_ONCE[0].fetch_add(1, Relaxed);
+    }
+    ask_split(2, looking);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -374,6 +480,7 @@ pub(crate) fn ask_once_end() {
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        j.ahead_views.clear();
     }
 }
 
@@ -763,11 +870,25 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// without); 2, a range whose blocks all have their bit is answered from
 /// the journal.
 fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    // `VICTORY_VIEWS_ONCE`: view memory asked of the guards with the
+    // submission, no block of it opened since.
+    if guarded && !j.ahead_views.is_empty() && j.ahead_views.iter().any(|&(a, b)| a <= first && last <= b) {
+        if !opened_in(first, last) {
+            VIEWS_ONCE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        }
+        VIEWS_ONCE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fallback = j.asked + 1;
+        let answer = writes_after_views(j, first, last, light);
+        if let Some((_, pages)) = &answer {
+            let found = pages.iter().filter(|&&(_, w)| w == fallback).count();
+            VIEWS_ONCE[3].fetch_add(found as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        return answer;
+    }
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
@@ -778,6 +899,18 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
                 .collect(),
         ));
     }
+    writes_rest(j, first, last, guarded, light)
+}
+
+/// [`writes_as`] for a range the journal does not answer: the light
+/// refresh's bits, the kernel, or the guards. `j` held.
+fn writes_after_views(j: &mut Journal, first: usize, last: usize, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_rest(j, first, last, true, light)
+}
+
+fn writes_rest(j: &mut Journal, first: usize, last: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
     // The light refresh: every block of the range is read-only by our hand
     // and unwritten since an asking noted it, or a hole noted for good
     // ([`PUBLISHED`]). The guards would find nothing written and this
@@ -2215,6 +2348,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if let (Some(&a), Some(&b)) = (blocks.first(), blocks.last()) {
+        opened(a, b + 1);
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -2456,6 +2592,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    opened(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);
@@ -2527,6 +2664,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// written. A commit no one tells of is found at the next look at the
 /// parked blocks that are no placeholder ([`Guards::parked`]).
 pub fn title_memory_committed(at: usize, len: usize) {
+    opened(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let parked: Vec<usize> = g.parked.range(range.clone()).copied().collect();
