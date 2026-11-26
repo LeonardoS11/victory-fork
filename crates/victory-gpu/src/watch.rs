@@ -599,7 +599,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
-    for &(start, end) in ranges {
+    let starts: Vec<usize> = ranges.iter().map(|r| r.0).collect();
+    let known = known_views(&starts);
+    for (&(start, end), &known) in ranges.iter().zip(&known) {
         if start >= end {
             continue;
         }
@@ -607,7 +609,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         // only fail there, one failed kernel call for each such copy at
         // every submission, and `writes` answers it from the guards
         // (after triippywhale cc368c7c).
-        if known_view_timed(start) {
+        if known {
             #[cfg(feature = "diagnostics")]
             AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if views_once() {
@@ -1444,14 +1446,17 @@ const BLOCK: usize = PAGE;
 /// hold (read-only by our hand, or noted absent): asking the kernel's write
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
-fn known_view(start: usize) -> bool {
+fn view_ask() -> bool {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let ask = *ASK.get_or_init(|| {
+    *ASK.get_or_init(|| {
         ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
             .iter()
             .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
-    });
-    if ask {
+    })
+}
+
+fn known_view(start: usize) -> bool {
+    if view_ask() {
         return false;
     }
     let first = start / BLOCK;
@@ -1460,8 +1465,37 @@ fn known_view(start: usize) -> bool {
     if light() && PUBLISHED.all(first, first + 1) {
         return true;
     }
-    let g = guards();
+    known_block(&guards(), first)
+}
+
+/// [`known_view`] of block `first`, the guards held.
+fn known_block(g: &Guards, first: usize) -> bool {
     g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first)) || (view_set() && covered(&g.views, first, first + 1))
+}
+
+/// [`known_view`] of each of `starts`, the guards' lock taken once and
+/// each block looked up once: a submission's asking looked up 6,300
+/// ranges a frame one at a time, a lock each, 8.3 ms (run AH3-d).
+fn known_views(starts: &[usize]) -> Vec<bool> {
+    let looking = std::time::Instant::now();
+    if view_ask() {
+        return vec![false; starts.len()];
+    }
+    let mut blocks: Vec<usize> = starts.iter().map(|s| s / BLOCK).collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    let known: Vec<bool> = {
+        let light = light();
+        let mut by_light: Vec<bool> = blocks.iter().map(|&b| light && PUBLISHED.all(b, b + 1)).collect();
+        let g = guards();
+        for (k, &b) in by_light.iter_mut().zip(&blocks) {
+            *k = *k || known_block(&g, b);
+        }
+        by_light
+    };
+    let answer = starts.iter().map(|s| known[blocks.binary_search(&(s / BLOCK)).unwrap_or(0)]).collect();
+    ask_split(2, looking);
+    answer
 }
 
 struct Guards {

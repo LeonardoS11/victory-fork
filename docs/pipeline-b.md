@@ -23,7 +23,11 @@ give the same result as the in-order one alone:
 So the in-order pass keeps every guarantee it has now. The work moves ahead
 only for ranges no one wrote in between, which is most of them.
 
-## The one rule: nothing an earlier unsent submission reads
+## The one rule: nothing a list being prepared reads
+
+(First version, target110: nothing any earlier unsent list held. Run AI3:
+17,800 of 21,400 items a frame left to the order, 3,600 made ahead. Now
+only lists whose preparing began count, see the end of this section.)
 
 Hazard: submission i, still not sent, refreshed range R (or will), then a
 step of i writes title memory in R (a title buffer copy). The flush before
@@ -85,3 +89,13 @@ thread-local flag.
 `host/ahead.rs` (host.rs is at 523.9 KB of the 524,288-byte limit). Calls in
 host.rs: one wait and one release in `Host::submit`. One call in
 `queue::submit_cut`.
+
+## Rule as of target111
+
+Only lists whose preparing began (`ahead::wait` marks them) and that were
+not sent yet hold their ranges. `Host::submit` marks first, then waits for
+every refresh ahead given before the mark. A list queued but not started
+has its refreshes made again in order after any made ahead, so the bytes
+it reads are those its own preparing leaves. The line splits what is left
+to the order: held, not write-watched, outside the asking aside, twice in
+one hand-over.

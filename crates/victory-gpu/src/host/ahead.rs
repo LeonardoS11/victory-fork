@@ -9,14 +9,15 @@
 //! was written since its copy last asked (the journal, `copied[page]`), so
 //! the in-order refresh finds little left and loses nothing.
 //!
-//! The one rule: nothing is refreshed ahead that a submission given
-//! earlier and not sent yet reads or has shaders write (its `Refresh`,
-//! `GpuWrite` and `Texture` steps). Its lists must read those bytes as its
-//! own preparing leaves them, not as a later submission's. `Host::submit`
-//! waits for the refreshes ahead of every submission given no later than
-//! its own before it prepares, so that none runs beside the preparing of a
-//! submission it could disturb (queues may run in another order than they
-//! were given).
+//! The one rule: nothing is refreshed ahead that a list being prepared
+//! (its preparing began, it was not sent yet) reads or has shaders write
+//! (its `Refresh`, `GpuWrite` and `Texture` steps): its lists must read
+//! those bytes as its own preparing leaves them, not as a later
+//! submission's. A list not being prepared yet has its refreshes made in
+//! order after any made ahead, which then find only what changed since.
+//! `Host::submit` marks its lists as being prepared and then waits for
+//! every refresh ahead given before that mark, which did not know it, so
+//! that none runs beside the preparing of a list it could disturb.
 
 use super::*;
 
@@ -57,10 +58,11 @@ struct Table {
     lists: std::collections::HashMap<usize, u64>,
     /// Numbers of lists whose refreshes ahead are not done.
     pending: std::collections::BTreeSet<u64>,
-    /// Since the last line: lists given, refreshes and textures registered,
-    /// made ahead, left out; microseconds of the helpers; of `Host::submit`'s
-    /// waits.
-    stats: [u64; 7],
+    /// Numbers of lists whose preparing in order began ([`wait`]) and that
+    /// were not sent yet: what they hold is not refreshed ahead.
+    started: std::collections::HashSet<u64>,
+    /// Since the last line ([`S_LISTS`]..).
+    stats: [u64; 10],
 }
 
 static TABLE: std::sync::LazyLock<Mutex<Table>> = std::sync::LazyLock::new(Default::default);
@@ -69,6 +71,21 @@ static DONE: std::sync::Condvar = std::sync::Condvar::new();
 fn table() -> std::sync::MutexGuard<'static, Table> {
     TABLE.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+// [`Table::stats`]' places: lists given, refreshes and textures, made
+// ahead, held by a list being prepared, copies not write-watched, not in
+// the asking aside (view memory and such), the same item twice in one job;
+// microseconds of the helpers, of `Host::submit`'s waits, and the waits.
+const S_LISTS: usize = 0;
+const S_ITEMS: usize = 1;
+const S_MADE: usize = 2;
+const S_HELD: usize = 3;
+const S_UNWATCHED: usize = 4;
+const S_NOT_ASIDE: usize = 5;
+const S_TWICE: usize = 6;
+const S_HELPER_US: usize = 7;
+const S_WAIT_US: usize = 8;
+const S_WAITS: usize = 9;
 
 /// One thing to make ahead.
 enum Item {
@@ -97,6 +114,8 @@ pub(crate) fn given(lists: &[crate::object::This]) {
         return;
     }
     let mut job = Job { seqs: Vec::new(), items: Vec::new() };
+    // (host copy or staging buffer, from, to) of the job's items.
+    let mut queued: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
     let mut t = table();
     let t = &mut *t;
     for &l in lists {
@@ -109,32 +128,41 @@ pub(crate) fn given(lists: &[crate::object::This]) {
         t.seq += 1;
         let seq = t.seq;
         t.lists.insert(key(list), seq);
-        t.stats[0] += 1;
+        t.stats[S_LISTS] += 1;
+        let started = &t.started;
         for step in &list.deferred().copies {
             match step {
                 Step::Refresh(shadow, at, len) | Step::GpuWrite(shadow, at, len) => {
                     let (from, to) = (*at, *at + *len);
-                    let ranges = t.shadows.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default();
-                    let free = !ranges.iter().any(|&(a, b, s)| s != seq && a < to && from < b);
+                    let at = std::sync::Arc::as_ptr(shadow) as usize;
+                    let ranges = t.shadows.entry(at).or_default();
+                    let held = ranges.iter().any(|&(a, b, s)| started.contains(&s) && a < to && from < b);
                     ranges.push((from, to, seq));
                     if let Step::Refresh(..) = step {
-                        t.stats[1] += 1;
-                        if free && !shadow.unwatched() {
-                            job.items.push(Item::Refresh(shadow.clone(), from, to));
+                        t.stats[S_ITEMS] += 1;
+                        if held {
+                            t.stats[S_HELD] += 1;
+                        } else if shadow.unwatched() {
+                            t.stats[S_UNWATCHED] += 1;
+                        } else if !queued.insert((at, from, to)) {
+                            t.stats[S_TWICE] += 1;
                         } else {
-                            t.stats[3] += 1;
+                            job.items.push(Item::Refresh(shadow.clone(), from, to));
                         }
                     }
                 }
                 Step::Texture(staging) => {
-                    let lists = t.stagings.entry(std::sync::Arc::as_ptr(staging) as usize).or_default();
-                    let free = lists.iter().all(|&s| s == seq);
+                    let at = std::sync::Arc::as_ptr(staging) as usize;
+                    let lists = t.stagings.entry(at).or_default();
+                    let held = lists.iter().any(|s| started.contains(s));
                     lists.push(seq);
-                    t.stats[1] += 1;
-                    if free {
-                        job.items.push(Item::Texture(staging.clone()));
+                    t.stats[S_ITEMS] += 1;
+                    if held {
+                        t.stats[S_HELD] += 1;
+                    } else if !queued.insert((at, 0, 0)) {
+                        t.stats[S_TWICE] += 1;
                     } else {
-                        t.stats[3] += 1;
+                        job.items.push(Item::Texture(staging.clone()));
                     }
                 }
                 _ => {}
@@ -166,9 +194,9 @@ fn helper() {
         let began = std::time::Instant::now();
         let made = run(&job.items);
         let mut t = table();
-        t.stats[2] += made;
-        t.stats[3] += job.items.len() as u64 - made;
-        t.stats[4] += began.elapsed().as_micros() as u64;
+        t.stats[S_MADE] += made;
+        t.stats[S_NOT_ASIDE] += job.items.len() as u64 - made;
+        t.stats[S_HELPER_US] += began.elapsed().as_micros() as u64;
         for s in &job.seqs {
             t.pending.remove(s);
         }
@@ -211,25 +239,26 @@ fn run(items: &[Item]) -> u64 {
     made
 }
 
-/// Before `runs` are prepared: the refreshes ahead of every list given no
-/// later than theirs are done.
+/// Before `runs` are prepared: they count as being prepared (what they
+/// hold is refreshed ahead no more), and every refresh ahead given until
+/// now, which did not know that, is done first.
 pub(crate) fn wait(runs: &[&HostList]) {
     if prewarm() == 0 {
         return;
     }
     let mut t = table();
-    let Some(last) = runs.iter().filter_map(|r| t.lists.get(&key(r)).copied()).max() else {
-        return;
-    };
-    if t.pending.first().is_none_or(|&s| s > last) {
+    let seqs: Vec<u64> = runs.iter().filter_map(|r| t.lists.get(&key(r)).copied()).collect();
+    t.started.extend(seqs);
+    let mark = t.seq;
+    if t.pending.first().is_none_or(|&s| s > mark) {
         return;
     }
     let began = std::time::Instant::now();
-    while t.pending.first().is_some_and(|&s| s <= last) {
+    while t.pending.first().is_some_and(|&s| s <= mark) {
         t = DONE.wait(t).unwrap_or_else(|e| e.into_inner());
     }
-    t.stats[5] += began.elapsed().as_micros() as u64;
-    t.stats[6] += 1;
+    t.stats[S_WAIT_US] += began.elapsed().as_micros() as u64;
+    t.stats[S_WAITS] += 1;
 }
 
 /// `runs` were prepared (their refreshes done, their snapshots taken):
@@ -243,6 +272,9 @@ pub(crate) fn sent(runs: &[&HostList]) {
     let seqs: Vec<u64> = runs.iter().filter_map(|r| t.lists.remove(&key(r))).collect();
     if seqs.is_empty() {
         return;
+    }
+    for s in &seqs {
+        t.started.remove(s);
     }
     t.shadows.retain(|_, ranges| {
         ranges.retain(|r| !seqs.contains(&r.2));
@@ -262,14 +294,18 @@ pub(crate) fn line(frames: f64) {
     let s = std::mem::take(&mut table().stats).map(|v| v as f64 / frames);
     tracing::info!(
         "refreshes ahead across submissions (VICTORY_PREWARM), per frame: {:.0} lists given, {:.0} refreshes and textures, \
-         {:.0} made ahead, {:.0} left to the order (held by an earlier list, or not asked aside); {:.2} ms on the helpers; \
-         Host::submit waited {:.2} ms in {:.1} waits",
-        s[0],
-        s[1],
-        s[2],
-        s[3],
-        s[4] / 1e3,
-        s[5] / 1e3,
-        s[6]
+         {:.0} made ahead; left to the order: {:.0} held by a list being prepared, {:.0} of copies not write-watched, \
+         {:.0} outside the asking aside (view memory and such), {:.0} the same item twice in one hand-over; {:.2} ms on \
+         the helpers; Host::submit waited {:.2} ms in {:.1} waits",
+        s[S_LISTS],
+        s[S_ITEMS],
+        s[S_MADE],
+        s[S_HELD],
+        s[S_UNWATCHED],
+        s[S_NOT_ASIDE],
+        s[S_TWICE],
+        s[S_HELPER_US] / 1e3,
+        s[S_WAIT_US] / 1e3,
+        s[S_WAITS]
     );
 }
