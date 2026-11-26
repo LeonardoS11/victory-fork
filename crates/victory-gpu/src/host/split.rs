@@ -162,14 +162,18 @@ pub(super) fn refresh_pieces() -> usize {
 
 /// A flush's refreshes as jobs for the helper threads ([`refresh_pieces`]).
 pub(super) fn refresh_jobs(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> Vec<Box<dyn FnOnce() + Send>> {
-    let parts = refresh_pieces();
+    let total: usize = refreshes.iter().map(|r| r.2 - r.1).sum();
+    let parts = if total < crate::shadow::wide_least() { 1 } else { refresh_pieces() };
     if parts < 2 {
+        // (A small flush, or one job a copy as `=1` asks: see the caller.)
+        if parts == 1 && refresh_pieces() >= 2 {
+            return vec![Box::new(move || refreshes.into_iter().for_each(|(shadow, from, to)| Batch::update(&shadow, from, to)))];
+        }
         return refreshes
             .into_iter()
             .map(|(shadow, from, to)| Box::new(move || Batch::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
             .collect();
     }
-    let total: usize = refreshes.iter().map(|r| r.2 - r.1).sum();
     let share = total.div_ceil(parts).max(1);
     let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(parts);
     let (mut group, mut bytes) = (Vec::new(), 0);
@@ -218,7 +222,9 @@ impl Batch {
             return;
         }
         let later = std::sync::Arc::new(std::mem::take(&mut self.later));
-        let parts = texture_wide().min(later.len()).max(1);
+        // A few textures are refreshed here (waking the helper threads costs
+        // more than they do).
+        let parts = if later.len() < 4 { 1 } else { texture_wide().min(later.len()) };
         let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..parts)
             .map(|part| {
                 let later = later.clone();

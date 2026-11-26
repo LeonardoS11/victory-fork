@@ -2305,7 +2305,8 @@ impl HostHeap {
             return;
         }
         let began = std::time::Instant::now();
-        let parts = heap_make_wide().max(1);
+        // A few slots are made here (waking the helper threads costs more).
+        let parts = if noted.len() < 256 { 1 } else { heap_make_wide().max(1) };
         let share = noted.len().div_ceil(parts).max(64);
         let at = std::ptr::from_ref(self) as usize;
         let noted = std::sync::Arc::new(noted);

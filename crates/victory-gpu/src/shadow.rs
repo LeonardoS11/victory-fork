@@ -1596,6 +1596,14 @@ thread_local! {
 /// pieces run, bytes copied.
 pub(crate) static SPLIT_COUNT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// The least work in bytes that goes to the helper threads for the
+/// submission's wide steps (`VICTORY_WIDE_MIN_KB`, 1024 by default):
+/// less is done on the thread that has it.
+pub(crate) fn wide_least() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_WIDE_MIN_KB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024usize) << 10)
+}
+
 /// From now on this thread's [`Shadow::copy`] notes the bytes to copy and
 /// leaves them ([`refresh_split`]).
 pub(crate) fn refresh_split_begin() {
@@ -1615,7 +1623,11 @@ pub(crate) fn refresh_split_end() {
         return;
     }
     let total: usize = copies.iter().map(|c| c.2).sum();
-    let parts = refresh_split().max(1);
+    // A small flush is copied here: waking the helper threads and waiting
+    // for the last of them cost more than its copies (the flushes of a
+    // frame are some sixty, most of them small: the frame doubled with the
+    // split at every flush, Series S runs AB3 and c100-f).
+    let parts = if total < wide_least() { 1 } else { refresh_split().max(1) };
     let share = total.div_ceil(parts).max(64 << 10);
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
