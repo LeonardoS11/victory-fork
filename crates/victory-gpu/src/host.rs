@@ -2963,6 +2963,18 @@ static LATE_STATS: [std::sync::atomic::AtomicU64; 18] = [const { std::sync::atom
 /// card, by why they settled (the `WHY_` places).
 static LATE_WAITED: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
+/// Of [`LATE_WAITED`]'s "title memory read": since the last frame line,
+/// microseconds a submission stood because a step of it reads memory
+/// flights may write, by the step: a title buffer copy, a fill (a constant
+/// buffer of a table), a texture's staging; and the waits. To decide
+/// whether doing such steps on the card (fork avatarmanz
+/// `VICTORY_CARD_STEPS`) would pay.
+static READ_WAITED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// The step that made [`blocked_by`] last answer [`WHY_READ`]: 0 a copy,
+/// 1 a fill, 2 a texture (under the submission lock).
+static READ_BY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     if from >= to {
@@ -3038,6 +3050,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             continue;
                         }
                         if count {
+                            READ_BY.store(0, Ordering::Relaxed);
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             fill_check::blocked_copy(written, dst, src, len);
@@ -3056,6 +3069,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             continue;
                         }
                         if count {
+                            READ_BY.store(1, Ordering::Relaxed);
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             fill_check::blocked(written, src, len);
@@ -3067,6 +3081,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     let (at, len) = staging.memory();
                     if touches(written, at, at + len) {
                         if count {
+                            READ_BY.store(2, Ordering::Relaxed);
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                         }
                         return Some(WHY_READ);
@@ -3915,6 +3930,16 @@ fn late_line(frames: f64) {
             w[WHY_WRITES],
             w[WHY_FENCE],
         );
+        let r: Vec<f64> = READ_WAITED.iter().map(|w| w.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if r[3] > 0.0 {
+            tracing::info!(
+                "submissions that stood for flights because a step reads what they may write, per frame: {:.1} waits;                  {:.2} ms for title buffer copies, {:.2} ms for fills of tables' constant buffers, {:.2} ms for textures'                  staging (fork avatarmanz VICTORY_CARD_STEPS would do the first two on the card)",
+                r[3],
+                r[0] / 1000.0,
+                r[1] / 1000.0,
+                r[2] / 1000.0
+            );
+        }
     }
     if relay() {
         let r: Vec<f64> = RELAY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -5921,12 +5946,17 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if let Some(why) = late_blocked(runs) {
+            let read_wait = (why == WHY_READ).then(|| (READ_BY.load(Ordering::Relaxed).min(2), std::time::Instant::now()));
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| blocked_by(&line.written, runs, false).is_none());
             } else {
                 self.settle(&mut submitted, why);
+            }
+            if let Some((by, began)) = read_wait {
+                READ_WAITED[by].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                READ_WAITED[3].fetch_add(1, Ordering::Relaxed);
             }
         }
         // Descriptors the title copied into placed heaps directly, before
@@ -8646,6 +8676,14 @@ impl Meter {
             tracing::info!(
                 "heap pass aside (VICTORY_HEAP_PASS_ASIDE=1): lists waited {:.2} ms per frame at their close for it",
                 aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames
+            );
+        }
+        if crate::list::call_time_on() {
+            let [calls, ns] = [0, 1].map(|i| crate::list::CALL_TIME[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "the title's threads inside our list calls (VICTORY_LIST_CALL_TIME=1), per frame: {calls:.0} calls,                  {:.1} ms (all threads together; {:.2} us a call)",
+                ns / 1e6,
+                if calls > 0.0 { ns / calls / 1e3 } else { 0.0 }
             );
         }
         {

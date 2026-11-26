@@ -625,6 +625,7 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
@@ -632,6 +633,7 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    let _timed = crate::list::call_timer();
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -745,6 +747,7 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
@@ -821,6 +824,7 @@ extern "system" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
@@ -853,6 +857,7 @@ fn unlike(dst: This, src: This) -> bool {
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -918,6 +923,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    let _timed = crate::list::call_timer();
     copy_resource(this, dst, src);
 }
 
@@ -943,6 +949,7 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1174,6 +1181,7 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    let _timed = crate::list::call_timer();
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1185,6 +1193,7 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1261,6 +1270,7 @@ extern "system" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
@@ -1311,6 +1321,7 @@ extern "system" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
@@ -1350,6 +1361,7 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1371,12 +1383,14 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
 
 /// `DriverHintX(feature, value)`: no hints for the host.
 extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
+    let _timed = crate::list::call_timer();
     0
 }
 
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
 extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+    let _timed = crate::list::call_timer();
     #[cfg(windows)]
     state::dispatch(this, x, y, z);
     #[cfg(not(windows))]
@@ -1406,6 +1420,7 @@ extern "system" fn resolve_queries(
     buffer: This,
     offset: u64,
 ) {
+    let _timed = crate::list::call_timer();
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1446,6 +1461,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
+    let _timed = crate::list::call_timer();
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
@@ -1462,6 +1478,7 @@ extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _siz
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
 extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
+    let _timed = crate::list::call_timer();
     reset(this, allocator, pipeline)
 }
 
@@ -1471,6 +1488,7 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
+    let _timed = crate::list::call_timer();
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
         return std::ptr::null_mut();
@@ -1513,6 +1531,7 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
+        let _timed = crate::list::call_timer();
         with_state(this, |list, s| s.set_topology(list, topology));
     }
     pub(super) extern "system" fn viewports(
@@ -1520,35 +1539,44 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
+        let _timed = crate::list::call_timer();
         // (Through the draw state, which keeps them for the host list
         // that continues this one after a cut: `State::replay`.)
         with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
+        let _timed = crate::list::call_timer();
         with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
+        let _timed = crate::list::call_timer();
         with_state(this, |list, s| {
             // SAFETY: the title passes four floats or null.
             s.set_blend_factor(list, unsafe { factor.as_ref() })
         });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
+        let _timed = crate::list::call_timer();
         with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        let _timed = crate::list::call_timer();
         with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| s.set_table(false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
     }
     pub(super) extern "system" fn graphics_constant(
@@ -1557,6 +1585,7 @@ mod state {
         value: u32,
         offset: u32,
     ) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
     }
     pub(super) extern "system" fn compute_constants(
@@ -1566,6 +1595,7 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| {
             s.set_constants(true, slot, items(values, count), offset)
         });
@@ -1577,18 +1607,22 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| {
             s.set_constants(false, slot, items(values, count), offset)
         });
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| s.set_view(true, slot, address));
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| s.set_view(false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
+        let _timed = crate::list::call_timer();
         // SAFETY: the title passes a view or null.
         with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
     }
@@ -1598,6 +1632,7 @@ mod state {
         count: u32,
         views: *const VertexView,
     ) {
+        let _timed = crate::list::call_timer();
         with_state(this, |_, s| {
             if views.is_null() {
                 s.clear_vertex_buffers(start, count);
@@ -1615,6 +1650,7 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
+        let _timed = crate::list::call_timer();
         let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
@@ -1633,18 +1669,21 @@ mod state {
         first: u32,
         first_instance: u32,
     ) {
+        let _timed = crate::list::call_timer();
         super::count_draw();
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        let _timed = crate::list::call_timer();
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        let _timed = crate::list::call_timer();
         super::count_draw();
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1662,6 +1701,7 @@ mod state {
         indirect: u64,
         _payload: u64,
     ) {
+        let _timed = crate::list::call_timer();
         super::count_draw();
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1678,6 +1718,7 @@ mod state {
         base: i32,
         first_instance: u32,
     ) {
+        let _timed = crate::list::call_timer();
         super::count_draw();
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
@@ -1743,6 +1784,7 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    let _timed = crate::list::call_timer();
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
@@ -1979,9 +2021,11 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         .push((this as usize, wait));
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    let _timed = crate::list::call_timer();
     wait_for(this, address, comparison, reference, false);
 }
 extern "system" fn wait_value64(this: This, address: u64, comparison: u32, reference: u64) {
+    let _timed = crate::list::call_timer();
     wait_for(this, address, comparison, reference, true);
 }
 
@@ -1991,6 +2035,7 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    let _timed = crate::list::call_timer();
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2017,10 +2062,12 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    let _timed = crate::list::call_timer();
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    let _timed = crate::list::call_timer();
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -2108,6 +2155,54 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
+/// `VICTORY_LIST_CALL_TIME=1`: the time the title's threads spend inside
+/// our list calls that do work (draws, dispatches, copies, barriers, state,
+/// tables, roots, close and reset), counted per frame line. Only the
+/// outermost call of a thread counts. To decide whether translating the
+/// calls on threads of ours (fork avatarmanz `VICTORY_THIN`) would pay.
+pub(crate) fn call_time_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CALL_TIME").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line, with [`call_time_on`]: calls timed, and the
+/// nanoseconds inside them (all threads).
+pub(crate) static CALL_TIME: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+thread_local! {
+    static CALL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Times a list call while it lives ([`call_time_on`]).
+pub(crate) struct CallTimer(Option<std::time::Instant>);
+
+#[inline]
+pub(crate) fn call_timer() -> CallTimer {
+    if !call_time_on() {
+        return CallTimer(None);
+    }
+    let outer = CALL_DEPTH.with(|d| {
+        let n = d.get();
+        d.set(n + 1);
+        n == 0
+    });
+    CallTimer(outer.then(std::time::Instant::now))
+}
+
+impl Drop for CallTimer {
+    fn drop(&mut self) {
+        if !call_time_on() {
+            return;
+        }
+        CALL_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        if let Some(began) = self.0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            CALL_TIME[0].fetch_add(1, Relaxed);
+            CALL_TIME[1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+}
+
 const METHODS: [(usize, *const ()); 52] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
