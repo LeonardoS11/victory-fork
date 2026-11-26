@@ -149,6 +149,45 @@ pub(super) fn list_calls_line(frames: f64) {
     }
 }
 
+/// `VICTORY_WIDE_REFRESH=<n>`, n of 2 or more: a flush's refreshes go to
+/// the helper threads in `n` pieces of about equal bytes, not one job a
+/// copy (`=1`); 0: not wide. (One job a copy measured no better, run 112:
+/// every update took the journal's and the guards' locks, and a flush held
+/// a few copies; with `VICTORY_VIEWS_ONCE` and `VICTORY_FLUSH_OVERLAP` a
+/// flush holds many and an update takes the journal's lock only to read.)
+pub(super) fn refresh_pieces() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_WIDE_REFRESH").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(32))
+}
+
+/// A flush's refreshes as jobs for the helper threads ([`refresh_pieces`]).
+pub(super) fn refresh_jobs(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) -> Vec<Box<dyn FnOnce() + Send>> {
+    let parts = refresh_pieces();
+    if parts < 2 {
+        return refreshes
+            .into_iter()
+            .map(|(shadow, from, to)| Box::new(move || Batch::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+            .collect();
+    }
+    let total: usize = refreshes.iter().map(|r| r.2 - r.1).sum();
+    let share = total.div_ceil(parts).max(1);
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::with_capacity(parts);
+    let (mut group, mut bytes) = (Vec::new(), 0);
+    for r in refreshes {
+        bytes += r.2 - r.1;
+        group.push(r);
+        if bytes >= share {
+            let g = std::mem::take(&mut group);
+            jobs.push(Box::new(move || g.into_iter().for_each(|(shadow, from, to)| Batch::update(&shadow, from, to))));
+            bytes = 0;
+        }
+    }
+    if !group.is_empty() {
+        jobs.push(Box::new(move || group.into_iter().for_each(|(shadow, from, to)| Batch::update(&shadow, from, to))));
+    }
+    jobs
+}
+
 /// Whether a title buffer copy at submission flushes only the pending
 /// refreshes whose range touches the bytes it writes
 /// (`VICTORY_FLUSH_OVERLAP=1`; off by default: every pending refresh, as

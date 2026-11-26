@@ -274,6 +274,8 @@ fn sync_heaps_inner(skip_cold: bool) {
         }
         // `VICTORY_TABLED_DEFER=1`: the slots left pending a frame ago
         // that no draw made since. Otherwise their count, for the line.
+        // `VICTORY_HEAP_MAKE_WIDE`: the slots the pages' walk noted.
+        host.make_noted();
         host.sweep_pending(start, step, mirrored_count);
         host.census_pending();
     }
@@ -372,6 +374,15 @@ pub(crate) fn sync_line(frames: f64) {
         tracing::info!(
             "of those mirrored per frame: {remade:.1} made their slot again, {same:.1} named the view it was made \
              from (skipped)"
+        );
+    }
+    if host::heap_make_wide() > 1 {
+        let [slots, pieces, micros] =
+            [0, 1, 2].map(|i| host::MAKE_WIDE[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "heap slots made beside other threads (VICTORY_HEAP_MAKE_WIDE={}), per frame: {slots:.0} in {pieces:.0} pieces, {:.2} ms",
+            host::heap_make_wide(),
+            micros / 1000.0
         );
     }
     if host::copied_wait() {

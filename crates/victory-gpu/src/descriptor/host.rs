@@ -2278,13 +2278,56 @@ impl HostHeap {
         // would clear it when the slot changes, and the same bytes would be
         // mirrored again at the next write of the page).
         let making = std::time::Instant::now();
-        for &(index, handle, _) in &due {
-            let (_, remade) = self.mirror_counted(index, handle, false, false, true);
-            COPIED_REMADE[usize::from(!remade)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `VICTORY_HEAP_MAKE_WIDE`: made together at the pass's end, beside
+        // other threads ([`HostHeap::make_noted`]).
+        if heap_make_wide() > 1 {
+            MAKE_NOTED.with(|n| n.borrow_mut().extend(due.iter().map(|&(index, handle, _)| (index, handle))));
+        } else {
+            for &(index, handle, _) in &due {
+                let (_, remade) = self.mirror_counted(index, handle, false, false, true);
+                COPIED_REMADE[usize::from(!remade)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         super::SYNC_PARTS[2].fetch_add((making - walking).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         super::SYNC_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         (looked, due.len() as u64)
+    }
+
+    /// With [`heap_make_wide`]: the slots this thread's
+    /// [`HostHeap::mirror_copied_page`] noted for this heap are made, in
+    /// [`heap_make_wide`] pieces on the helper threads (making views is
+    /// free-threaded: [`Made`] keys and a lock per stripe of slots), and
+    /// the caller waits for all of them.
+    pub(crate) fn make_noted(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let noted = MAKE_NOTED.with(|n| std::mem::take(&mut *n.borrow_mut()));
+        if noted.is_empty() {
+            return;
+        }
+        let began = std::time::Instant::now();
+        let parts = heap_make_wide().max(1);
+        let share = noted.len().div_ceil(parts).max(64);
+        let at = std::ptr::from_ref(self) as usize;
+        let noted = std::sync::Arc::new(noted);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..noted.len().div_ceil(share))
+            .map(|k| {
+                let noted = noted.clone();
+                Box::new(move || {
+                    // SAFETY: the heap outlives the jobs: the caller waits
+                    // for them (`wide_run`) under the heaps' lock.
+                    let heap = unsafe { &*(at as *const HostHeap) };
+                    for &(index, handle) in noted.iter().skip(k * share).take(share) {
+                        let (_, remade) = heap.mirror_counted(index, handle, false, false, true);
+                        COPIED_REMADE[usize::from(!remade)].fetch_add(1, Relaxed);
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        MAKE_WIDE[0].fetch_add(noted.len() as u64, Relaxed);
+        MAKE_WIDE[1].fetch_add(jobs.len() as u64, Relaxed);
+        crate::shadow::wide_run(jobs);
+        MAKE_WIDE[2].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        super::SYNC_PARTS[3].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 
     /// `VICTORY_COPIED_WAIT=1`: the records [`HostHeap::mirror_copied_page`]
@@ -2931,6 +2974,26 @@ fn copied_grace() -> u64 {
 /// Since the last frame line, with [`copied_wait`]: records set waiting,
 /// mirrored after their wait, left to draws that read them through a
 /// table meanwhile, and records that were no view looked at under `made`.
+/// `VICTORY_HEAP_MAKE_WIDE=<n>` (off by default; 0 or 1: off): the host
+/// slots of records the title copied into its heap as bytes are made at
+/// the pass's end in `n` pieces on the helper threads, not one by one on
+/// the submitting thread while the pages are walked (11.5 ms a frame of
+/// that thread, Series S, run AB3).
+pub(crate) fn heap_make_wide() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_HEAP_MAKE_WIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(32))
+}
+
+thread_local! {
+    /// With [`heap_make_wide`]: slots noted by this thread's page walks,
+    /// for [`HostHeap::make_noted`].
+    static MAKE_NOTED: std::cell::RefCell<Vec<(u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Since the last frame line, with [`heap_make_wide`]: slots made, pieces,
+/// microseconds (the wall time of the making).
+pub(crate) static MAKE_WIDE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 pub(crate) static COPIED_WAIT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// `VICTORY_TABLED_CENSUS=0`: the skipped tables' slots are not marked

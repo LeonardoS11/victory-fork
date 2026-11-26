@@ -8909,9 +8909,8 @@ fn wide_refresh() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_WIDE_REFRESH").as_deref() {
-        Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 0,
+        _ => u8::from(split::refresh_pieces() > 0),
     }) {
         0 => false,
         1 => true,
@@ -9153,11 +9152,7 @@ impl Batch {
             for (shadow, from, to) in &self.refreshes {
                 Self::brought(&mut self.current, shadow, *from, *to);
             }
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                .collect();
+            let jobs = split::refresh_jobs(self.refreshes.drain(..).collect());
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
             let over = summed.saturating_sub(started.elapsed().as_micros() as u64);
