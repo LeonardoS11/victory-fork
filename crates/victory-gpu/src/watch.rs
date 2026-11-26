@@ -87,6 +87,10 @@ struct Journal {
     /// range inside one from the journal while no block of it was opened
     /// since ([`OPENED`]).
     ahead_views: Vec<(usize, usize)>,
+    /// `ahead` in order of its starts, with the farthest end so far at each
+    /// place ([`ahead_holds`]); made again when `ahead` has another length.
+    ahead_sorted: Vec<(usize, usize)>,
+    ahead_reach: Vec<usize>,
 }
 
 /// 4 KiB pieces in a page.
@@ -101,7 +105,45 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead_asked: 0,
     kept: false,
     ahead_views: Vec::new(),
+    ahead_sorted: Vec::new(),
+    ahead_reach: Vec::new(),
 });
+
+/// Whether pages `[first, last)` lie inside one range of the submission's
+/// asking ahead (`j.ahead`): a search in its ranges in order and their
+/// farthest end so far, not a walk over some 240 of them for each of the
+/// 5,500 refreshes of a frame (the journal's part of "the journal and
+/// guards asked", 8-11 ms a frame, Series S run AB3).
+fn ahead_holds(j: &mut Journal, first: usize, last: usize) -> bool {
+    if j.ahead.is_empty() {
+        return false;
+    }
+    if j.ahead_sorted.len() != j.ahead.len() {
+        j.ahead_sorted.clear();
+        j.ahead_sorted.extend_from_slice(&j.ahead);
+        j.ahead_sorted.sort_unstable();
+        j.ahead_reach.clear();
+        let mut reach = 0;
+        for &(_, b) in &j.ahead_sorted {
+            reach = reach.max(b);
+            j.ahead_reach.push(reach);
+        }
+    }
+    let n = j.ahead_sorted.partition_point(|&(a, _)| a <= first);
+    n > 0 && j.ahead_reach[n - 1] >= last && sorted_holds(&j.ahead_sorted[..n], first, last)
+}
+
+/// Whether one of `ranges` (in order of their starts, each starting at or
+/// before `first`) reaches `last`: from the latest start back.
+fn sorted_holds(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+    ranges.iter().rev().any(|&(a, b)| a <= first && last <= b)
+}
+
+/// Whether `[first, last)` lies inside one of `ranges` (in order, apart).
+fn apart_holds(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let n = ranges.partition_point(|&(a, _)| a <= first);
+    n > 0 && ranges[n - 1].1 >= last
+}
 
 /// Whether a submission's view memory is asked of the guards once, with its
 /// kernel asking ([`ask_once`]), and each refresh of it then answered from
@@ -476,7 +518,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if !ahead_holds(j, first, last) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
         }
     }
@@ -1040,7 +1082,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
     let j = &mut *j;
     // `VICTORY_VIEWS_ONCE`: view memory asked of the guards with the
     // submission, no block of it opened since.
-    if guarded && !j.ahead_views.is_empty() && j.ahead_views.iter().any(|&(a, b)| a <= first && last <= b) {
+    if guarded && !j.ahead_views.is_empty() && apart_holds(&j.ahead_views, first, last) {
         if !opened_in(first, last) {
             VIEWS_ONCE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Some((j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
@@ -1055,7 +1097,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
         return answer;
     }
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if ahead_holds(j, first, last) {
         return Some((
             j.ahead_asked,
             j.written
@@ -3969,5 +4011,27 @@ mod v12c_tests {
         // A gap exactly at the bound joins.
         assert_eq!(reservation_run(&[(0, 4), (12, 16)], 0, (0, 100), 8), (0, 16, 2));
         assert_eq!(reservation_run(&[(0, 4), (13, 16)], 0, (0, 100), 8), (0, 4, 1));
+    }
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::{apart_holds, sorted_holds};
+
+    /// A range is held where one asked range covers it whole; overlapping
+    /// ranges in any order are looked at from the latest start back.
+    #[test]
+    fn held_ranges_are_found_by_search_as_by_walk() {
+        let mut ranges = vec![(10, 20), (0, 50), (60, 70), (65, 100), (200, 210)];
+        let walk = |r: &[(usize, usize)], f: usize, l: usize| r.iter().any(|&(a, b)| a <= f && l <= b);
+        ranges.sort_unstable();
+        for (f, l) in [(0, 5), (12, 18), (45, 55), (66, 90), (60, 101), (205, 210), (150, 160), (0, 50), (19, 51)] {
+            let n = ranges.partition_point(|&(a, _)| a <= f);
+            assert_eq!(n > 0 && sorted_holds(&ranges[..n], f, l), walk(&ranges, f, l), "({f}, {l})");
+        }
+        let apart = [(0, 10), (20, 30), (40, 50)];
+        for (f, l) in [(0, 10), (5, 9), (10, 20), (21, 30), (29, 31), (45, 50), (50, 51)] {
+            assert_eq!(apart_holds(&apart, f, l), walk(&apart, f, l), "({f}, {l})");
+        }
     }
 }
