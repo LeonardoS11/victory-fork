@@ -199,9 +199,78 @@ fn hash_due(unwritten: bool, turn: bool, changing: bool) -> bool {
     !unwritten || turn || changing
 }
 
+/// What a texture's bytes are taken for, to tell whether they changed
+/// since they were last sent up: BLAKE3, or with `VICTORY_TEXTURE_HASH=fast`
+/// a 128-bit digest of four 64-bit lanes (multiply and rotate, then
+/// folded with the length), some three times faster per MB and as good
+/// for telling a change, which no one makes on purpose here (after
+/// Steenax6 3b018c1: 0.174 -> 0.060 ms per MB with a digest of its own).
+fn content_hash(bytes: &[u8]) -> [u8; 32] {
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*FAST.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HASH").is_some_and(|v| v == "fast")) {
+        return *blake3::hash(bytes).as_bytes();
+    }
+    let mut out = [0u8; 32];
+    out[..16].copy_from_slice(&fast_digest(bytes).to_le_bytes());
+    out
+}
+
+/// [`content_hash`]'s fast form: 128 bits.
+fn fast_digest(bytes: &[u8]) -> u128 {
+    const K: [u64; 4] = [0x9E37_79B9_7F4A_7C15, 0xC2B2_AE3D_27D4_EB4F, 0x1656_67B1_9E37_79F9, 0x85EB_CA77_C2B2_AE63];
+    let mut h = [K[1], K[2], K[3], K[0]];
+    let mut chunks = bytes.chunks_exact(32);
+    for c in &mut chunks {
+        for (lane, w) in h.iter_mut().zip(c.chunks_exact(8)) {
+            let w = u64::from_le_bytes(w.try_into().unwrap_or([0; 8]));
+            *lane = (*lane ^ w).wrapping_mul(K[0]).rotate_left(29);
+        }
+    }
+    let mut tail = [0u8; 32];
+    let rest = chunks.remainder();
+    tail[..rest.len()].copy_from_slice(rest);
+    for (lane, w) in h.iter_mut().zip(tail.chunks_exact(8)) {
+        let w = u64::from_le_bytes(w.try_into().unwrap_or([0; 8]));
+        *lane = (*lane ^ w).wrapping_mul(K[1]).rotate_left(31);
+    }
+    let fold = |a: u64, b: u64, k: u64| {
+        let x = (a ^ b.rotate_left(17)).wrapping_mul(k);
+        x ^ (x >> 29)
+    };
+    let len = bytes.len() as u64;
+    let lo = fold(fold(h[0], h[1], K[2]), len, K[3]);
+    let hi = fold(fold(h[2], h[3], K[0]), lo ^ len, K[1]);
+    u128::from(lo) | (u128::from(hi) << 64)
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::fast_digest;
+
+    /// Equal bytes give one digest; a change of any one bit, or of the
+    /// length, gives another.
+    #[test]
+    fn a_change_of_one_bit_or_of_the_length_is_another_digest() {
+        let bytes: Vec<u8> = (0..300u32).map(|i| (i * 37 + 11) as u8).collect();
+        let d = fast_digest(&bytes);
+        assert_eq!(d, fast_digest(&bytes.clone()));
+        for at in [0, 7, 31, 32, 255, 299] {
+            for bit in [0, 5] {
+                let mut b = bytes.clone();
+                b[at] ^= 1 << bit;
+                assert_ne!(fast_digest(&b), d, "byte {at} bit {bit}");
+            }
+        }
+        assert_ne!(fast_digest(&bytes[..299]), d);
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_ne!(fast_digest(&longer), d, "a zero byte more");
+    }
+}
+
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<[u8; 32]>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -1229,7 +1298,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                let hash = blake3::hash(read);
+                let hash = content_hash(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
@@ -1249,7 +1318,7 @@ impl Staging {
         }
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
+                let hash = content_hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 last.changing = last.hash != Some(hash);
@@ -1266,7 +1335,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        let hash = content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         last.changing = last.hash != Some(hash);
@@ -1292,7 +1361,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = blake3::hash(read);
+            let hash = content_hash(read);
             last.changing = last.hash != Some(hash);
             if last.changing {
                 last.hash = Some(hash);
