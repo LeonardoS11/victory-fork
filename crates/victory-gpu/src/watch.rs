@@ -167,6 +167,33 @@ pub(crate) fn views_once() -> bool {
 static OPENED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static OPENED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a submission's asking of the guards about view memory
+/// ([`views_once`]) leaves out the ranges the last submission's asking
+/// held where no block was opened (written, mapped, committed) since
+/// (`VICTORY_VIEWS_KEEP=1`; off by default): the guards would find nothing
+/// new there, and the journal has what they found before. The asking took
+/// 6-7 ms a frame of the submitting thread in some 2,100 ranges, nine
+/// submissions asking about much the same views (run AO3).
+///
+/// What it assumes: every change to view memory comes through [`opened`]
+/// (the guards' faults, the runtime's mappings and commits). A block found
+/// uncommitted that becomes committed without the runtime saying so is
+/// seen when the guards are asked about it again: at the next submission
+/// whose ranges are not all kept.
+fn views_keep() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| views_once() && std::env::var_os("VICTORY_VIEWS_KEEP").is_some_and(|v| v == "1"))
+}
+
+/// With [`views_keep`]: the view ranges the last asking held (pages, in
+/// order, apart), and of the asking before, those no block opened since
+/// touches (made at [`ask_once`]).
+static KEPT_VIEWS: Mutex<(Vec<(usize, usize)>, Vec<(usize, usize)>)> = Mutex::new((Vec::new(), Vec::new()));
+
+/// Since the last frame line, with [`views_keep`]: view ranges kept from
+/// the last asking, and asked of the guards.
+pub(crate) static VIEWS_KEPT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Times [`OPENED`] was emptied (under its lock): an asking aside of view
 /// memory ([`ask_aside`]) made while it held a count still sees in it every
 /// block opened since, while the count is the same.
@@ -313,6 +340,12 @@ fn ask_by_size(bytes: usize, since: std::time::Instant, pages: usize) {
 /// With the frame line: [`ASK_SPLIT`] per frame.
 pub(crate) fn ask_split_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
+    if views_keep() {
+        let [kept, asked] = [0, 1].map(|i| VIEWS_KEPT[i].swap(0, Relaxed) as f64 / frames);
+        tracing::info!(
+            "view ranges of the submissions' askings, per frame (VICTORY_VIEWS_KEEP=1): {kept:.0} kept from the asking before (no block opened since), {asked:.0} asked of the guards"
+        );
+    }
     if views_once() {
         let v: Vec<f64> = VIEWS_ONCE.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -662,6 +695,14 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // refreshes answered from this asking (`ask_views` comes after).
     if views_once() {
         let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
+        // `VICTORY_VIEWS_KEEP`: the last asking's view ranges that no block
+        // opened since touches.
+        if views_keep() {
+            let mut kept = KEPT_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+            let (asked, clean) = &mut *kept;
+            *clean = std::mem::take(asked);
+            clean.retain(|&(a, b)| !any_opened(&opened, a, b));
+        }
         opened.clear();
         OPENED_CLEARS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         drop(opened);
@@ -752,16 +793,33 @@ fn ask_views(j: &mut Journal, mut views: Vec<(usize, usize)>) {
         }
     }
     let now = j.ahead_asked;
+    let (keep, clean) = if views_keep() {
+        (true, std::mem::take(&mut KEPT_VIEWS.lock().unwrap_or_else(|e| e.into_inner()).1))
+    } else {
+        (false, Vec::new())
+    };
+    let mut held: Vec<(usize, usize)> = Vec::new();
     for (first, last) in joined {
+        if keep && apart_holds(&clean, first, last) {
+            j.ahead_views.push((first, last));
+            held.push((first, last));
+            VIEWS_KEPT[0].fetch_add(1, Relaxed);
+            continue;
+        }
         let Some(written) = guard(first * PAGE, last * PAGE) else {
             continue;
         };
+        held.push((first, last));
+        VIEWS_KEPT[1].fetch_add(1, Relaxed);
         for page in written {
             j.page_written(page, now);
         }
         j.ahead_views.push((first, last));
         VIEWS_ONCE[0].fetch_add(1, Relaxed);
         ASK_SPLIT[12].fetch_add(1, Relaxed);
+    }
+    if keep {
+        KEPT_VIEWS.lock().unwrap_or_else(|e| e.into_inner()).0 = held;
     }
     ask_split(11, looking);
 }
