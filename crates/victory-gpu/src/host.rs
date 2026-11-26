@@ -8874,7 +8874,7 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        batch.texture_now_or_later(staging);
                     }
                     continue;
                 }
@@ -9000,6 +9000,8 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// `split::texture_wide`: textures due, refreshed at the next flush.
+    later: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -9118,6 +9120,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        self.textures_later();
         FLUSH_SPLIT[0].fetch_add(1, Ordering::Relaxed);
         FLUSH_SPLIT[1].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
         self.index.clear();

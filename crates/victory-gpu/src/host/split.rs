@@ -188,6 +188,47 @@ pub(super) fn refresh_jobs(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>
     jobs
 }
 
+/// `VICTORY_TEXTURE_WIDE=<n>` (off by default; 0 or 1: off): the textures a
+/// submission's steps bring up to date wait for the next flush of
+/// refreshes (before any step of ours writes title memory, and at the
+/// end), and are then refreshed on `n` threads at once. Each refresh is a
+/// texture's own (its own lock and notes, the journal read under its
+/// lock, a read buffer per thread): 6-8 ms a frame one after the other on
+/// the submitting thread (Series S, run AB3).
+pub(super) fn texture_wide() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_TEXTURE_WIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(32))
+}
+
+impl Batch {
+    /// A texture due: refreshed now, or with [`texture_wide`] at the next
+    /// flush.
+    pub(super) fn texture_now_or_later(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        if texture_wide() > 1 {
+            self.later.push(staging.clone());
+        } else {
+            staging.refresh();
+        }
+    }
+
+    /// The textures left for the flush ([`texture_wide`]), refreshed on the
+    /// helper threads; this waits for all of them.
+    pub(super) fn textures_later(&mut self) {
+        if self.later.is_empty() {
+            return;
+        }
+        let later = std::sync::Arc::new(std::mem::take(&mut self.later));
+        let parts = texture_wide().min(later.len()).max(1);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..parts)
+            .map(|part| {
+                let later = later.clone();
+                Box::new(move || later.iter().skip(part).step_by(parts).for_each(|s| s.refresh())) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+    }
+}
+
 /// Whether a title buffer copy at submission flushes only the pending
 /// refreshes whose range touches the bytes it writes
 /// (`VICTORY_FLUSH_OVERLAP=1`; off by default: every pending refresh, as
