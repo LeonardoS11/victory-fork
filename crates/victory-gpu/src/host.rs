@@ -81,6 +81,12 @@ static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Submissions started and not finished yet: lists the card may still be
+/// running, which read the view heap's slots as they run.
+pub(crate) fn submissions_in_flight() -> u64 {
+    STARTED.load(Ordering::Relaxed).saturating_sub(FINISHED.load(Ordering::Relaxed))
+}
+
 /// A retired object, dropped on whatever thread finishes the submission.
 struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // SAFETY: what is retired is D3D12 objects (free-threaded) and the
@@ -656,7 +662,7 @@ fn submission_us(i: usize, us: u64) {
 /// refreshes queued, shader writes declared, textures, other), the
 /// refreshes' batch flushed, the asking's end, the snapshots, the card's
 /// work before the lists; and the whole (the last).
-static PREP_SPLIT: [std::sync::atomic::AtomicU64; 13] = [const { std::sync::atomic::AtomicU64::new(0) }; 13];
+static PREP_SPLIT: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 
 /// [`PREP_SPLIT`]'s slots.
 mod prep {
@@ -669,6 +675,8 @@ mod prep {
     pub(super) const CARD: usize = 10;
     pub(super) const SETTLED: usize = 11;
     pub(super) const WHOLE: usize = 12;
+    /// After the preparing, not in it: the lists handed to the card.
+    pub(super) const HAND: usize = 13;
 }
 
 /// A step's kind for [`PREP_SPLIT`]: 0 a title buffer copy, 1 a fill, 2 a
@@ -696,7 +704,7 @@ fn prep_line(frames: f64) {
     }
     let sum: f64 = s[..prep::SETTLED].iter().sum();
     tracing::info!(
-        "preparing per frame, in slices that add up ({:.1} ms; settles taken out, {:.1} ms): write watch asked ahead {:.1};          steps: buffer copies {:.1}, fills {:.1}, refreshes queued {:.1}, shader writes declared {:.1}, textures {:.1},          other {:.1}; refreshes flushed {:.1}; asking's end {:.1}; snapshots {:.1}; card before the lists {:.1};          left {:.1}",
+        "preparing per frame, in slices that add up ({:.1} ms; settles taken out, {:.1} ms): write watch asked ahead {:.1};          steps: buffer copies {:.1}, fills {:.1}, refreshes queued {:.1}, shader writes declared {:.1}, textures {:.1},          other {:.1}; refreshes flushed {:.1}; asking's end {:.1}; snapshots {:.1}; card before the lists {:.1};          left {:.1}; then the lists handed to the card {:.1}",
         s[prep::WHOLE],
         s[prep::SETTLED],
         s[prep::ASK],
@@ -710,7 +718,8 @@ fn prep_line(frames: f64) {
         s[prep::ASK_END],
         s[prep::SNAPSHOTS],
         s[prep::CARD],
-        s[prep::WHOLE] - sum
+        s[prep::WHOLE] - sum,
+        s[prep::HAND]
     );
 }
 
@@ -4601,10 +4610,17 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let gave_up = crate::shadow::merge_gave_up();
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; in these frames the merge gave up (the flights are then settled whole): {} times \
+             because the copy's memory is not watched, {} because the write tracking had no answer, {} for more changed runs than \
+             VICTORY_MERGE_RUNS leaves, {} for a copy in PC memory without its snapshot",
+            bytes / (1 << 20) as f64,
+            gave_up[0],
+            gave_up[1],
+            gave_up[2],
+            gave_up[3]
         );
     }
 }
@@ -6735,6 +6751,9 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
+            // After the preparing: the hand-over to the card (upstream
+            // ac25549 counts it as a part).
+            prep_add(prep::HAND, prepared.elapsed());
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -6965,6 +6984,23 @@ impl Host {
                 NAMED[0].load(Ordering::Relaxed),
                 NAMED[1].load(Ordering::Relaxed)
             ));
+            // The runtime can classify a removal even when it supplies no
+            // fault address. Older runtimes still have the DRED1 report below.
+            match dred.cast::<ID3D12DeviceRemovedExtendedData2>() {
+                Ok(dred2) => {
+                    // SAFETY: a query on the live DRED interface.
+                    let state = unsafe { dred2.GetDeviceState() };
+                    let name = match state {
+                        D3D12_DRED_DEVICE_STATE_HUNG => "hung",
+                        D3D12_DRED_DEVICE_STATE_FAULT => "fault",
+                        D3D12_DRED_DEVICE_STATE_PAGEFAULT => "page fault",
+                        D3D12_DRED_DEVICE_STATE_UNKNOWN => "unknown",
+                        _ => "unrecognized",
+                    };
+                    text.push_str(&format!("; DRED device state {name} ({})", state.0));
+                }
+                Err(e) => text.push_str(&format!("; DRED device state unavailable ({:#010X})", e.code().0)),
+            }
         }
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
