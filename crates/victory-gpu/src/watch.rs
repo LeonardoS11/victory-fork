@@ -632,6 +632,19 @@ fn reservation_of(page: usize) -> Option<(usize, usize)> {
 /// ranges, sorted) grouped by the reservation they lie in, one asking over
 /// each group's span (at most [`AHEAD_MAX`] pages a call). Pieces in no
 /// reservation, or whose asking fails, are left to [`writes`].
+/// [`ask_by_reservation`]'s largest gap inside one asking, in pages
+/// (`VICTORY_RESERVATION_GAP=<MiB>`, 8 by default as [`AHEAD_GAP`]; 0:
+/// none, every range of a reservation in one asking as before).
+fn reservation_gap() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_RESERVATION_GAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(AHEAD_GAP, |mb| (mb << 20) / PAGE)
+    })
+}
+
 fn ask_by_reservation(j: &mut Journal, pieces: &[(usize, usize)]) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut i = 0;
@@ -650,7 +663,17 @@ fn ask_by_reservation(j: &mut Journal, pieces: &[(usize, usize)]) {
         let first = pieces[i].0;
         let mut last = pieces[i].1.min(r_end);
         let mut k = i + 1;
-        while k < pieces.len() && pieces[k].0 < r_end && pieces[k].0 >= r_first {
+        // `VICTORY_RESERVATION_GAP=<MiB>` (8 by default; 0: none): the span
+        // ends where the next range lies that far past it, and the next
+        // asking begins there. The kernel walks the page tables of all it
+        // is asked about: 46 askings over whole spans of reservations were
+        // 19-20 ms a frame of the submitting thread (Series S, run M3).
+        let gap = reservation_gap();
+        while k < pieces.len()
+            && pieces[k].0 < r_end
+            && pieces[k].0 >= r_first
+            && (gap == 0 || pieces[k].0 <= last + gap)
+        {
             last = last.max(pieces[k].1.min(r_end));
             k += 1;
         }
