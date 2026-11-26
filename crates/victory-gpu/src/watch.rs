@@ -466,12 +466,20 @@ impl AsideAsking {
     /// for view memory asked unguarded (not write-watched, as the kernel
     /// would say).
     fn answer(&self, first: usize, last: usize, guarded: bool) -> Option<Option<(u64, Vec<(usize, u64)>)>> {
-        let collect = || {
-            let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
-            Some((self.now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
-        };
+        self.holds(first, last, guarded).map(|now| {
+            now.map(|now| {
+                let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+                (now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect())
+            })
+        })
+    }
+
+    /// [`AsideAsking::answer`] without the pages: `Some(Some(now))` where
+    /// the journal answers as of `now`, `Some(None)` where the answer is
+    /// none, `None` where the asking does not hold the range.
+    fn holds(&self, first: usize, last: usize, guarded: bool) -> Option<Option<u64>> {
         if apart_holds(&self.kernel, first, last) {
-            return Some(collect());
+            return Some(Some(self.now));
         }
         if !apart_holds(&self.views, first, last) {
             return None;
@@ -483,7 +491,7 @@ impl AsideAsking {
         if OPENED_CLEARS.load(std::sync::atomic::Ordering::Acquire) != self.clears || opened_in(first, last) {
             return None;
         }
-        Some(collect())
+        Some(Some(self.now))
     }
 }
 
@@ -763,17 +771,21 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// one another's way on the lock taken alone (42 ms a frame summed over
 /// the threads where one thread alone took 11, Series S run AE3).
 fn read_answer(j: &Journal, first: usize, last: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    let collect = |j: &Journal| j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    read_holds(j, first, last, guarded).then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+}
+
+/// Whether [`read_answer`] answers pages `[first, last)` (with the
+/// submission's asking, `j.ahead_asked`).
+fn read_holds(j: &Journal, first: usize, last: usize, guarded: bool) -> bool {
     if guarded && !j.ahead_views.is_empty() && apart_holds(&j.ahead_views, first, last) && !opened_in(first, last) {
         VIEWS_ONCE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Some((j.ahead_asked, collect(j)));
+        return true;
     }
     if j.ahead.is_empty() || j.ahead_sorted.len() != j.ahead.len() {
-        return None;
+        return false;
     }
     let n = j.ahead_sorted.partition_point(|&(a, _)| a <= first);
-    (n > 0 && j.ahead_reach[n - 1] >= last && sorted_holds(&j.ahead_sorted[..n], first, last))
-        .then(|| (j.ahead_asked, collect(j)))
+    n > 0 && j.ahead_reach[n - 1] >= last && sorted_holds(&j.ahead_sorted[..n], first, last)
 }
 
 /// [`views_once`]: the guards asked once about `views` (page ranges of view
@@ -1539,6 +1551,23 @@ fn failed_asking(start: usize, end: usize) {
 /// result is the asking.
 pub(crate) fn writes_into(start: usize, end: usize, guarded: bool, written: &mut Vec<(usize, u64)>) -> Option<u64> {
     written.clear();
+    // Answered from the journal under its lock taken shared (an asking
+    // aside on this thread, or the submission's): straight into `written`,
+    // no list made for each of the 5,400 refreshes of a frame.
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let into = |written: &mut Vec<(usize, u64)>, j: &Journal| written.extend(j.written.range(first..last).map(|(&p, &w)| (p, w)));
+    if let Some(held) = ASIDE.with(|a| a.borrow().as_ref().and_then(|s| s.holds(first, last, guarded))) {
+        let now = held?;
+        into(written, &JOURNAL.read().unwrap_or_else(|e| e.into_inner()));
+        return Some(now);
+    }
+    {
+        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+        if j.kept && read_holds(&j, first, last, guarded) {
+            into(written, &j);
+            return Some(j.ahead_asked);
+        }
+    }
     let (now, pages) = writes(start, end, guarded)?;
     written.extend(pages);
     Some(now)
