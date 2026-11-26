@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub(crate) mod aside;
 mod split;
-pub(crate) use split::flush_split;
+pub(crate) use split::{flush_split, texture_wide};
 use split::{FLUSH_SPLIT, flush_line, prep, prep_add, prep_line, step_kind};
 use windows::core::{Interface, PCWSTR, w};
 

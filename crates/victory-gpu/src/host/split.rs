@@ -207,7 +207,7 @@ pub(super) fn refresh_jobs(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>
 /// texture's own (its own lock and notes, the journal read under its
 /// lock, a read buffer per thread): 6-8 ms a frame one after the other on
 /// the submitting thread (Series S, run AB3).
-pub(super) fn texture_wide() -> usize {
+pub(crate) fn texture_wide() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| std::env::var("VICTORY_TEXTURE_WIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(32))
 }

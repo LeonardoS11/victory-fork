@@ -963,6 +963,15 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     };
     list.defer_texture(staging.clone());
     list.defer_host(move || {
+        // `detiled` is the refresh's: with the textures refreshed at the
+        // next flush (`VICTORY_TEXTURE_WIDE`) the refresh has not run yet in
+        // this step's order, and the levels it detiled got no memory of the
+        // card (the upload went to none: the wire fence's alpha texture read
+        // zeros, runs AE3 and AF3, 4 of 4). Refreshed here first; the flush's
+        // refresh then finds nothing new.
+        if crate::host::texture_wide() > 1 {
+            staging.refresh();
+        }
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting.store(
             if waiting {
