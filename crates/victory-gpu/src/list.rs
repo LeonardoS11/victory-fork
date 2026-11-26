@@ -2162,7 +2162,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// calls on threads of ours (fork avatarmanz `VICTORY_THIN`) would pay.
 pub(crate) fn call_time_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CALL_TIME").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_CALL_TIME").is_some_and(|v| v == "1") || crate::critical::on())
 }
 
 /// Since the last frame line, with [`call_time_on`]: calls timed, and the
