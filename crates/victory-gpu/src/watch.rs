@@ -711,6 +711,10 @@ fn reservation_gap() -> usize {
 
 fn ask_by_reservation(j: &mut Journal, pieces: &[(usize, usize)]) {
     use std::sync::atomic::Ordering::Relaxed;
+    // `VICTORY_ASK_WIDE=<n>`: the spans are found first, asked beside one
+    // another, and what they found noted after ([`ask_spans_wide`]).
+    let wide = ask_wide() > 1;
+    let mut spans: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         if not_watched(pieces[i].0) {
@@ -725,6 +729,16 @@ fn ask_by_reservation(j: &mut Journal, pieces: &[(usize, usize)]) {
             continue;
         };
         let (first, last, k) = reservation_run(pieces, i, (r_first, r_end), reservation_gap());
+        if wide {
+            let mut from = first;
+            while from < last {
+                let to = last.min(from + AHEAD_MAX);
+                spans.push((from, to, r_first, r_end));
+                from = to;
+            }
+            i = k;
+            continue;
+        }
         let mut from = first;
         while from < last {
             let to = last.min(from + AHEAD_MAX);
@@ -743,6 +757,85 @@ fn ask_by_reservation(j: &mut Journal, pieces: &[(usize, usize)]) {
             from = to;
         }
         i = k;
+    }
+    if !spans.is_empty() {
+        ask_spans_wide(j, spans);
+    }
+}
+
+/// `VICTORY_ASK_WIDE=<n>` (off by default; 0 or 1: off): the submission's
+/// kernel askings by reservation are made on `n` threads at once, each
+/// span into an answer of its own, and the pages found are noted in the
+/// journal after, in span order. The askings were 11 ms a frame of the
+/// submitting thread with the gap cut (Series S, run AB3), 46 calls in a
+/// row; whether the kernel lets them run side by side is what this shows.
+fn ask_wide() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_ASK_WIDE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(16))
+}
+
+/// [`ask_wide`]: `spans` (pages from, to, and the reservation's first and
+/// end page) asked on the helper threads; then each found span is noted
+/// as [`ask_kernel`] notes it, and a failed one forgets its reservation.
+fn ask_spans_wide(j: &mut Journal, spans: Vec<(usize, usize, usize, usize)>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let parts = ask_wide().min(spans.len()).max(1);
+    let spans = std::sync::Arc::new(spans);
+    // Per span: the pages found (addresses), or None if it failed.
+    let answers: std::sync::Arc<Vec<Mutex<Option<Vec<usize>>>>> =
+        std::sync::Arc::new((0..spans.len()).map(|_| Mutex::new(None)).collect());
+    let started = std::time::Instant::now();
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..parts)
+        .map(|part| {
+            let (spans, answers) = (spans.clone(), answers.clone());
+            Box::new(move || {
+                for (n, &(from, to, ..)) in spans.iter().enumerate().skip(part).step_by(parts) {
+                    let mut count = (to - from) * PAGE / KERNEL_PAGE;
+                    let mut found = vec![0usize; count];
+                    let mut granularity = 0;
+                    // SAFETY: the answer buffer holds `count` entries.
+                    let failed = unsafe {
+                        GetWriteWatch(
+                            WRITE_WATCH_FLAG_RESET,
+                            (from * PAGE) as *const _,
+                            (to - from) * PAGE,
+                            found.as_mut_ptr().cast(),
+                            &mut count,
+                            &mut granularity,
+                        )
+                    } != 0;
+                    if !failed {
+                        found.truncate(count);
+                        *answers[n].lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+                    }
+                }
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    ask_split(3, started);
+    let now = j.ahead_asked;
+    for (n, &(from, to, r_first, r_end)) in spans.iter().enumerate() {
+        ASK_SPLIT[8].fetch_add(1, Relaxed);
+        BY_RESERVATION[0].fetch_add(1, Relaxed);
+        match answers[n].lock().unwrap_or_else(|e| e.into_inner()).take() {
+            Some(found) => {
+                ASK_SPLIT[9].fetch_add(found.len() as u64, Relaxed);
+                let noting = std::time::Instant::now();
+                for at in found {
+                    j.piece_written(at, now);
+                }
+                ask_split(4, noting);
+                j.ahead.push((from, to));
+            }
+            None => {
+                BY_RESERVATION[1].fetch_add(1, Relaxed);
+                RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).remove(&r_first);
+                NOT_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).insert(r_first, (r_end, crate::frame::current()));
+            }
+        }
     }
 }
 

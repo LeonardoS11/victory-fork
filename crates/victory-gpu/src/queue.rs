@@ -545,6 +545,7 @@ fn worker() {
             }
         }
         release_held_now(false);
+        crate::critical::worker(started.elapsed().as_nanos() as u64);
         let (user_now, kernel_now) = crate::framelog::thread_times();
         crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
         crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));

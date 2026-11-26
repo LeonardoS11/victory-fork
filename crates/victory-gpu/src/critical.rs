@@ -88,7 +88,15 @@ pub(crate) fn list_call(ns: u64) {
 
 /// Since the line: frames, their nanoseconds; execute calls, ns inside,
 /// ns waiting for the submission lock; ns inside `Present`.
-static TOTALS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static TOTALS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Our submitting thread (`VICTORY_ASYNC_SUBMIT`, `crate::queue` worker)
+/// was at work for `ns`.
+pub(crate) fn worker(ns: u64) {
+    if on() {
+        TOTALS[6].fetch_add(ns, Relaxed);
+    }
+}
 
 /// The threads that called `ExecuteCommandLists` since the line (ids).
 static EXECUTERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
@@ -189,12 +197,14 @@ pub(crate) fn line() {
     threads.sort_by(|a, b| b.0.cmp(&a.0));
     tracing::info!(
         "critical path per frame (VICTORY_CRITICAL_PATH=1): frame {:.1} ms; ExecuteCommandLists {:.1} calls, {:.1} ms inside \
-         (of it {:.1} waiting for the submission lock) on threads [{}]; Present {:.1} ms; recording threads: {}",
+         on the title's threads (of it {:.1} waiting for the submission lock) on threads [{}]; our submitting thread at \
+         work {:.1} ms (VICTORY_ASYNC_SUBMIT); Present {:.1} ms; recording threads: {}",
         ms(t[1]),
         t[2] as f64 / frames,
         ms(t[3]),
         ms(t[4]),
         executers.join(", "),
+        ms(t[6]),
         ms(t[5]),
         threads.into_iter().take(8).map(|t| t.1).collect::<Vec<_>>().join("; ")
     );
