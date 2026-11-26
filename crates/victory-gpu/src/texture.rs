@@ -351,24 +351,25 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // An upload from title memory can have already used this view. Only
+    // a copy from the same GPU source can satisfy this read.
+    list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = list
-        .transition(source, COPY_SOURCE)
-        .map(|(texture, before)| {
-            let state = crate::host::legal_state(texture, COPY_SOURCE);
-            let barrier = crate::host::transition(
-                texture,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(state as i32),
-            );
-            // SAFETY: an open list and a live texture.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
-            before
-        });
-    if !first && before.is_none() {
+    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
+        let state = crate::host::legal_state(texture, COPY_SOURCE);
+        let barrier = crate::host::transition(
+            texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(state as i32),
+        );
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        before
+    });
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
