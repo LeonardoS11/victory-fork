@@ -240,6 +240,27 @@ fn known_view_timed(start: usize) -> bool {
     known
 }
 
+/// Since the last frame line, the submission's kernel askings by the size
+/// of the span asked about (under 1 MB, 16 MB, 256 MB, more): askings,
+/// nanoseconds, pages found. Whether the kernel's time follows the span
+/// or the pages written in it.
+static ASK_BY_SIZE: [[std::sync::atomic::AtomicU64; 3]; 4] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 4];
+
+fn ask_by_size(bytes: usize, since: std::time::Instant, pages: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let size = match bytes {
+        b if b < 1 << 20 => 0,
+        b if b < 16 << 20 => 1,
+        b if b < 256 << 20 => 2,
+        _ => 3,
+    };
+    let [n, ns, found] = &ASK_BY_SIZE[size];
+    n.fetch_add(1, Relaxed);
+    ns.fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+    found.fetch_add(pages as u64, Relaxed);
+}
+
 /// With the frame line: [`ASK_SPLIT`] per frame.
 pub(crate) fn ask_split_line(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -258,6 +279,15 @@ pub(crate) fn ask_split_line(frames: f64) {
         return;
     }
     let ms = |i: usize| s[i] / 1e6 / frames;
+    let by: Vec<String> = ["<1 MB", "<16 MB", "<256 MB", ">=256 MB"]
+        .iter()
+        .zip(&ASK_BY_SIZE)
+        .map(|(name, [n, ns, found])| {
+            let [n, ns, found] = [n, ns, found].map(|v| v.swap(0, Relaxed) as f64 / frames);
+            format!("{name} {n:.1} askings {:.2} ms {found:.0} pages", ns / 1e6)
+        })
+        .collect();
+    tracing::info!("the submission's kernel askings by the span asked, per frame: {}", by.join("; "));
     tracing::info!(
         "the write watch asked ahead, by part, ms per frame: spans gathered {:.2}, journal lock waited {:.2}, view memory \
          looked up {:.2}, kernel asked (GetWriteWatch with reset) {:.2} in {:.0} askings over {:.0} ranges finding {:.0} \
@@ -761,6 +791,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         return false;
     }
     ASK_SPLIT[9].fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+    ask_by_size((last - first) * PAGE, started, count);
     let noting = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     {
