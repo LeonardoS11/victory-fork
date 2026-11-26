@@ -56,6 +56,10 @@ pub(super) static FLUSH_SPLIT: [std::sync::atomic::AtomicU64; 7] = [const { std:
 
 /// Adds the time since `since` to part `i` of [`FLUSH_SPLIT`].
 pub(crate) fn flush_split(i: usize, since: std::time::Instant) {
+    // (Refreshes made ahead are not the flushes': `ahead`'s own line.)
+    if super::ahead::HERE.get() {
+        return;
+    }
     FLUSH_SPLIT[i].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
@@ -96,6 +100,7 @@ pub(super) fn flush_line(frames: f64) {
 
 /// With the frame line: [`PREP_SPLIT`] per frame.
 pub(super) fn prep_line(frames: f64) {
+    super::ahead::line(frames);
     if loading_flights() > 0 {
         tracing::info!(
             "flights capped while loading (VICTORY_LOADING_FLIGHTS={}, after {} submissions in a frame): found full {} times since the last line",

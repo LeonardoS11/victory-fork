@@ -401,6 +401,92 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
 }
 
+thread_local! {
+    /// [`ask_aside`] on this thread: its number and the page ranges it
+    /// asked (in order, apart).
+    static ASIDE: std::cell::RefCell<Option<(u64, Vec<(usize, usize)>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The asking of [`ask_aside`] stands on this thread while this lives.
+pub(crate) struct Aside;
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        ASIDE.with(|a| *a.borrow_mut() = None);
+    }
+}
+
+/// Refreshes made ahead of their submission (`crate::host::ahead`): asks
+/// the kernel once about `ranges` as [`ask_ahead`] does, notes what it
+/// found in the journal, and lets [`writes`] on this thread answer ranges
+/// inside what it asked from the journal, under the lock taken shared. The
+/// submission being prepared keeps its own asking ([`ask_once`]): this one
+/// has its own number and leaves `ahead` as it was. A refresh's answer may
+/// then hold pages written under a later number than its own asking's;
+/// the copy takes them and asks again next time (`copied[page]`).
+pub(crate) fn ask_aside(ranges: &[(usize, usize)]) -> Option<Aside> {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    pieces.retain(|&(first, _)| !known_view(first * PAGE));
+    if pieces.is_empty() {
+        return None;
+    }
+    pieces.sort_unstable();
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    let (kept, asked_before) = (std::mem::take(&mut j.ahead), j.ahead_asked);
+    j.asked += 1;
+    let now = j.asked;
+    j.ahead_asked = now;
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len() && pieces[k].0 <= last + AHEAD_GAP && last.max(pieces[k].1) - first <= AHEAD_MAX {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        if ask_kernel(j, first, last) {
+            j.ahead.push((first, last));
+        } else {
+            // Not one reservation: each piece by itself.
+            for &(a, b) in &pieces[i..k] {
+                if ask_kernel(j, a, b) {
+                    j.ahead.push((a, b));
+                }
+            }
+        }
+        i = k;
+    }
+    let mut asked = std::mem::replace(&mut j.ahead, kept);
+    j.ahead_asked = asked_before;
+    drop(j);
+    // In order, joined where they overlap ([`apart_holds`]).
+    asked.sort_unstable();
+    let mut apart: Vec<(usize, usize)> = Vec::with_capacity(asked.len());
+    for (a, b) in asked {
+        match apart.last_mut() {
+            Some(l) if a <= l.1 => l.1 = l.1.max(b),
+            _ => apart.push((a, b)),
+        }
+    }
+    if apart.is_empty() {
+        return None;
+    }
+    ASIDE.with(|a| *a.borrow_mut() = Some((now, apart)));
+    Some(Aside)
+}
+
+/// Whether `[start, end)` lies inside the asking of [`ask_aside`] that
+/// stands on this thread.
+pub(crate) fn aside_holds(start: usize, end: usize) -> bool {
+    ASIDE.with(|a| a.borrow().as_ref().is_some_and(|(_, r)| apart_holds(r, start / PAGE, end.div_ceil(PAGE))))
+}
+
 /// Since the last frame line: the kernel askings that took a millisecond
 /// or more, their microseconds, and the longest asking's. An asking walks
 /// page tables, some ten microseconds for most ranges; in run 75 the 2,644
@@ -467,7 +553,19 @@ pub(crate) fn once() -> bool {
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
+/// Submissions in [`ask_once`] now: a pass ahead over the heaps
+/// (`crate::descriptor::sync_ahead_on`) does not ask the kernel beside one.
+pub(crate) static ASKING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+    ASKING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    struct Asked;
+    impl Drop for Asked {
+        fn drop(&mut self) {
+            ASKING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+    let _asked = Asked;
     SUBMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !once() {
         return;
@@ -1102,6 +1200,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// the journal.
 fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // A refresh made ahead, inside its asking ([`ask_aside`]).
+    if let Some(now) = ASIDE.with(|a| a.borrow().as_ref().and_then(|(n, r)| apart_holds(r, first, last).then_some(*n))) {
+        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+        return Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+    }
     {
         let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
         if j.kept
@@ -3026,6 +3129,41 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// An asking aside answers its thread from the journal; what it found
+    /// is in the journal for every other asker as well.
+    #[test]
+    fn an_asking_aside_answers_its_thread_and_notes_for_all() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        // Tests beside this one leave the guards blocks of memory they let
+        // go, which the system may give this allocation again.
+        if (0..4).any(|k| known_view(p + k * PAGE)) {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            return;
+        }
+        let _ = writes(start, end, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write(1) };
+        let aside = ask_aside(&[(p, p + PAGE), (p + 2 * PAGE, p + 3 * PAGE)]).expect("asked");
+        assert!(aside_holds(p + 2 * PAGE, p + 3 * PAGE));
+        assert!(!aside_holds(p + 3 * PAGE, p + 5 * PAGE));
+        let (now, written) = writes(p + 2 * PAGE, p + 3 * PAGE, false).expect("answered aside");
+        assert_eq!(written, [(p / PAGE + 2, now)]);
+        drop(aside);
+        assert!(!aside_holds(p + 2 * PAGE, p + 3 * PAGE));
+        // Another asking still finds the page, under the asking that saw it.
+        let (later, again) = writes(start, end, false).expect("watched");
+        assert!(later > now);
+        assert_eq!(again, [(p / PAGE + 2, now)]);
+        // Kept, not let go: the journal keeps what it noted of these pages,
+        // which another test given the same addresses would find.
     }
 
     /// A kernel read into a guarded view block fails; opened first, it

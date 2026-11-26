@@ -188,6 +188,11 @@ pub(crate) fn sync_ahead_on() -> bool {
         if on {
             let _ = std::thread::Builder::new().name("victory-heap-ahead".into()).spawn(|| {
                 crate::framelog::keep_on_fast_cores("victory-heap-ahead");
+                AHEAD_HERE.set(true);
+                let every = std::time::Duration::from_millis(
+                    std::env::var("VICTORY_HEAP_SYNC_AHEAD_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8),
+                );
+                let mut last = std::time::Instant::now();
                 loop {
                     {
                         let mut due = AHEAD_DUE.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -196,6 +201,19 @@ pub(crate) fn sync_ahead_on() -> bool {
                         }
                         *due = false;
                     }
+                    // At most one pass every `every` (the pokes between are
+                    // one): each pass asks the kernel, and 100 passes a
+                    // frame stood in the way of the submissions' askings
+                    // (run AG3: their asking 12.4 -> 18 ms, ours 33-37 ms).
+                    let since = last.elapsed();
+                    if since < every {
+                        std::thread::sleep(every - since);
+                    }
+                    // Not beside a submission's asking of the kernel.
+                    while crate::watch::ASKING.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                        std::thread::yield_now();
+                    }
+                    last = std::time::Instant::now();
                     let began = std::time::Instant::now();
                     sync_heaps();
                     AHEAD_PASSES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -278,7 +296,7 @@ fn sync_heaps_inner(skip_cold: bool) {
         };
         let asking = std::time::Instant::now();
         let ranges = written.take(start as usize, looked_end);
-        SYNC_PARTS[0].fetch_add(asking.elapsed().as_micros() as u64, Relaxed);
+        sync_part(0, asking.elapsed().as_micros() as u64);
         for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -290,7 +308,7 @@ fn sync_heaps_inner(skip_cold: bool) {
                 page_bytes.resize(to - from, 0);
                 let reading = std::time::Instant::now();
                 let read = crate::host::read_into(from as *const u8, &mut page_bytes);
-                SYNC_PARTS[1].fetch_add(reading.elapsed().as_micros() as u64, Relaxed);
+                sync_part(1, reading.elapsed().as_micros() as u64);
                 if read {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
@@ -397,7 +415,19 @@ fn sync_cut() -> bool {
 /// the host slots of the records that changed. An instrument: the pass is
 /// 8 to 13 ms a frame and cutting the pages read took nothing off it (run
 /// 286).
-pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// Places 4 to 7: the same, paid by the pass ahead ([`sync_ahead_on`]).
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+thread_local! {
+    /// This thread is the pass ahead's ([`sync_ahead_on`]).
+    static AHEAD_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Adds `us` to part `i` of [`SYNC_PARTS`], in the pass ahead's places on
+/// its thread.
+pub(crate) fn sync_part(i: usize, us: u64) {
+    SYNC_PARTS[i + if AHEAD_HERE.get() { 4 } else { 0 }].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
@@ -478,13 +508,17 @@ pub(crate) fn sync_line(frames: f64) {
              {same:.1} the sweep found made from their record already (skipped)"
         );
     }
-    let parts = [0, 1, 2, 3].map(|i| SYNC_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3 / frames);
+    let parts = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| SYNC_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e3 / frames);
     tracing::info!(
-        "the pass over the title's view heap by part, ms per frame: asking which pages changed {:.2}, reading the pages {:.2},          the walk over their records {:.2}, making the host slots of the changed records {:.2}",
-        parts[0],
-        parts[1],
-        parts[2],
-        parts[3]
+        "the pass over the title's view heap by part, ms per frame: asking which pages changed {:.2}, reading the pages {:.2},          the walk over their records {:.2}, making the host slots of the changed records {:.2}; of it on the thread ahead          (VICTORY_HEAP_SYNC_AHEAD=1): {:.2}, {:.2}, {:.2}, {:.2}",
+        parts[0] + parts[4],
+        parts[1] + parts[5],
+        parts[2] + parts[6],
+        parts[3] + parts[7],
+        parts[4],
+        parts[5],
+        parts[6],
+        parts[7]
     );
 }
 

@@ -2288,8 +2288,8 @@ impl HostHeap {
                 COPIED_REMADE[usize::from(!remade)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        super::SYNC_PARTS[2].fetch_add((making - walking).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-        super::SYNC_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        super::sync_part(2, (making - walking).as_micros() as u64);
+        super::sync_part(3, making.elapsed().as_micros() as u64);
         (looked, due.len() as u64)
     }
 
@@ -2328,7 +2328,7 @@ impl HostHeap {
         MAKE_WIDE[1].fetch_add(jobs.len() as u64, Relaxed);
         crate::shadow::wide_run(jobs);
         MAKE_WIDE[2].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
-        super::SYNC_PARTS[3].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        super::sync_part(3, began.elapsed().as_micros() as u64);
     }
 
     /// `VICTORY_COPIED_WAIT=1`: the records [`HostHeap::mirror_copied_page`]

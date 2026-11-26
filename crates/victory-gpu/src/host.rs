@@ -18,7 +18,9 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub(crate) mod aside;
+mod ahead;
 mod split;
+pub(crate) use ahead::given as ahead_given;
 pub(crate) use split::{flush_split, texture_wide};
 use split::{FLUSH_SPLIT, flush_line, prep, prep_add, prep_line, step_kind};
 use windows::core::{Interface, PCWSTR, w};
@@ -6828,6 +6830,7 @@ impl Host {
                 READ_WAITED[3].fetch_add(1, Ordering::Relaxed);
             }
         }
+        ahead::wait(runs);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
         // `VICTORY_HEAP_SYNC_FRAME=1`: at the frame's first submission only.
@@ -6942,6 +6945,7 @@ impl Host {
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
         slice(prep::SNAPSHOTS, settled);
+        ahead::sent(runs);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.

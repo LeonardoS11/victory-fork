@@ -259,6 +259,10 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
+    // `VICTORY_PREWARM`: what of them can be refreshed ahead is.
+    if behind() {
+        crate::host::ahead_given(lists);
+    }
     let first = if !behind() && lock(&queue(this).held).is_empty() {
         lists
             .iter()
