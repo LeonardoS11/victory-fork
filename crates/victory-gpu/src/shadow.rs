@@ -3795,6 +3795,14 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        let began = std::time::Instant::now();
+        let copied = self.update_free_as(from, to);
+        // (the whole, by kind of copy, for the flush's line)
+        crate::host::flush_split(if self.watched.load(Ordering::Relaxed) == NOT_WATCHED { 6 } else { 5 }, began);
+        copied
+    }
+
+    fn update_free_as(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             // The light refresh (`VICTORY_LIGHT_REFRESH`): nothing of the
             // range was written that the copy does not hold, and the
@@ -3810,8 +3818,12 @@ impl Shadow {
                 return 0;
             }
             let mut written = WRITTEN.take();
+            let asking = std::time::Instant::now();
             let now = crate::watch::writes_into(from, to, true, &mut written);
+            crate::host::flush_split(3, asking);
+            let copying = std::time::Instant::now();
             let copied = now.map(|now| self.copy_stale(from, to, now, &written));
+            crate::host::flush_split(4, copying);
             WRITTEN.set(written);
             if let Some(copied) = copied {
                 self.watched.store(1, Ordering::Relaxed);

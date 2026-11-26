@@ -142,6 +142,65 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
+/// Since the last frame line, of the submission's asking ahead (the
+/// preparing's slice "write watch asked ahead"), nanoseconds by part: 0
+/// the spans of the refreshes gathered (`Host::submit`), 1 waits for the
+/// journal's lock, 2 the look whether a range is view memory the guards
+/// hold ([`known_view`]), 3 the kernel's write watch asked (with its
+/// reset), 4 the pages it found noted, 5 reservations looked up
+/// ([`reservation_of`]), 6 holes looked at again, 7 the look for title
+/// bytes under flights (`stale_under_flights`, its settles not counted);
+/// then counts: 8 kernel askings, 9 pages they found, 10 ranges asked.
+pub(crate) static ASK_SPLIT: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// Adds the time since `since` to part `i` of [`ASK_SPLIT`].
+pub(crate) fn ask_split(i: usize, since: std::time::Instant) {
+    ASK_SPLIT[i].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The journal, its wait counted ([`ASK_SPLIT`] part 1).
+fn journal_timed() -> std::sync::MutexGuard<'static, Journal> {
+    let waiting = std::time::Instant::now();
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    ask_split(1, waiting);
+    j
+}
+
+/// [`known_view`], timed ([`ASK_SPLIT`] part 2).
+fn known_view_timed(start: usize) -> bool {
+    let looking = std::time::Instant::now();
+    let known = known_view(start);
+    ask_split(2, looking);
+    known
+}
+
+/// With the frame line: [`ASK_SPLIT`] per frame.
+pub(crate) fn ask_split_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s: Vec<f64> = ASK_SPLIT.iter().map(|n| n.swap(0, Relaxed) as f64).collect();
+    if s[8] == 0.0 && s[0] == 0.0 {
+        return;
+    }
+    let ms = |i: usize| s[i] / 1e6 / frames;
+    tracing::info!(
+        "the write watch asked ahead, by part, ms per frame: spans gathered {:.2}, journal lock waited {:.2}, view memory \
+         looked up {:.2}, kernel asked (GetWriteWatch with reset) {:.2} in {:.0} askings over {:.0} ranges finding {:.0} \
+         pages, pages noted {:.2}, reservations looked up {:.2}, holes looked at {:.2}, title bytes under flights looked \
+         for {:.2}",
+        ms(0),
+        ms(1),
+        ms(2),
+        ms(3),
+        s[8] / frames,
+        s[10] / frames,
+        s[9] / frames,
+        ms(4),
+        ms(5),
+        ms(6),
+        ms(7)
+    );
+}
+
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
@@ -152,7 +211,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal_timed();
     let j = &mut *j;
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
@@ -167,7 +226,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     // triippywhale d0581a55). `VICTORY_VIEW_ASK=1` asks as before.
     #[cfg(feature = "diagnostics")]
     let all = pieces.len();
-    pieces.retain(|&(first, _)| !known_view(first * PAGE));
+    pieces.retain(|&(first, _)| !known_view_timed(first * PAGE));
     #[cfg(feature = "diagnostics")]
     AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
     j.asked += 1;
@@ -268,11 +327,14 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // The light refresh: a few of the holes known by their bits are asked
     // of Windows again, a submission at a time ([`look_at_holes`]).
     if light_kept() {
+        let looking = std::time::Instant::now();
         look_at_holes(HOLES_A_LOOK);
+        ask_split(6, looking);
     }
+    ASK_SPLIT[10].fetch_add(ranges.len() as u64, std::sync::atomic::Ordering::Relaxed);
     ask_once_end();
     ask_ahead(ranges);
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal_timed();
     let j = &mut *j;
     if j.ahead.is_empty() {
         // `ask_ahead` asked nothing (fewer than two ranges).
@@ -292,7 +354,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         // only fail there, one failed kernel call for each such copy at
         // every submission, and `writes` answers it from the guards
         // (after triippywhale cc368c7c).
-        if known_view(start) {
+        if known_view_timed(start) {
             #[cfg(feature = "diagnostics")]
             AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
@@ -308,7 +370,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut j = journal_timed();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
@@ -471,7 +533,10 @@ fn ask_by_reservation(j: &mut Journal, pieces: &[(usize, usize)]) {
             i += 1;
             continue;
         }
-        let Some((r_first, r_end)) = reservation_of(pieces[i].0) else {
+        let looking = std::time::Instant::now();
+        let reservation = reservation_of(pieces[i].0);
+        ask_split(5, looking);
+        let Some((r_first, r_end)) = reservation else {
             i += 1;
             continue;
         };
@@ -530,7 +595,6 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
     let failed = unsafe {
@@ -543,9 +607,13 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    ask_split(3, started);
+    ASK_SPLIT[8].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if failed {
         return false;
     }
+    ASK_SPLIT[9].fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+    let noting = std::time::Instant::now();
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -563,6 +631,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         let at = j.found[k];
         j.piece_written(at, now);
     }
+    ask_split(4, noting);
     true
 }
 

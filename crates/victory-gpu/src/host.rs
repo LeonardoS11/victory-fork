@@ -696,6 +696,39 @@ fn prep_add(slot: usize, d: std::time::Duration) {
     PREP_SPLIT[slot].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
 }
 
+/// Since the last frame line, of the refreshes' flushes ([`Batch::flush`]):
+/// 0 flushes, 1 refreshes they did (after joining); nanoseconds of 2 the
+/// write watch asked ahead in them, 3 the journal (and the guards) asked
+/// what changed ([`crate::watch::writes_into`]), 4 the changed pages copied
+/// (`copy_stale`), and the updates whole: 5 of write-watched memory (3, 4
+/// and the rest), 6 of memory not watched (copied whole).
+static FLUSH_SPLIT: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Adds the time since `since` to part `i` of [`FLUSH_SPLIT`].
+pub(crate) fn flush_split(i: usize, since: std::time::Instant) {
+    FLUSH_SPLIT[i].fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// With the frame line: [`FLUSH_SPLIT`] per frame.
+fn flush_line(frames: f64) {
+    let s: Vec<f64> = FLUSH_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if s[0] == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "the refreshes' flushes per frame: {:.0} flushes doing {:.0} refreshes; ms: write watch asked ahead {:.2}; updates of \
+         watched memory {:.2} (the journal and guards asked {:.2}, changed pages copied {:.2}); updates of memory not watched, \
+         copied whole, {:.2}",
+        s[0],
+        s[1],
+        s[2] / 1e6,
+        s[5] / 1e6,
+        s[3] / 1e6,
+        s[4] / 1e6,
+        s[6] / 1e6
+    );
+}
+
 /// With the frame line: [`PREP_SPLIT`] per frame.
 fn prep_line(frames: f64) {
     let s: Vec<f64> = PREP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
@@ -4278,6 +4311,15 @@ fn given_to_shaders<'a>(
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
+/// [`stale_under_flights`], timed for the asking ahead's line
+/// (`crate::watch::ASK_SPLIT` part 7).
+fn stale_timed(runs: &[&HostList]) -> bool {
+    let looking = std::time::Instant::now();
+    let stale = stale_under_flights(runs);
+    crate::watch::ask_split(7, looking);
+    stale
+}
+
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
@@ -6938,6 +6980,7 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
+            let gathering = std::time::Instant::now();
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
@@ -6952,18 +6995,19 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            crate::watch::ask_split(0, gathering);
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_timed(runs) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_timed(runs) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -9171,6 +9215,8 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        FLUSH_SPLIT[0].fetch_add(1, Ordering::Relaxed);
+        FLUSH_SPLIT[1].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
         self.index.clear();
         // Copies of one title buffer that lie close together become one:
         // the refresh moves 460 to 1,370 MB a frame in 25,000 to 90,000
@@ -9191,6 +9237,7 @@ impl Batch {
                 .collect();
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
+            flush_split(2, started);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
@@ -9860,12 +9907,28 @@ impl Meter {
             );
         }
         prep_line(frames);
+        crate::watch::ask_split_line(frames);
+        flush_line(frames);
         if crate::list::call_time_on() {
             let [calls, ns] = [0, 1].map(|i| crate::list::CALL_TIME[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let mut by: Vec<(f64, f64, &str)> = crate::list::CALL_BY
+                .iter()
+                .zip(crate::list::CALL_NAMES)
+                .map(|([n, t], name)| {
+                    (t.swap(0, Ordering::Relaxed) as f64 / frames, n.swap(0, Ordering::Relaxed) as f64 / frames, name)
+                })
+                .collect();
+            by.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let top: Vec<String> = by
+                .iter()
+                .take(6)
+                .map(|&(t, n, name)| format!("{name} {:.1} ms ({n:.0} calls, {:.1} us)", t / 1e6, if n > 0.0 { t / n / 1e3 } else { 0.0 }))
+                .collect();
             tracing::info!(
-                "the title's threads inside our list calls (VICTORY_LIST_CALL_TIME=1), per frame: {calls:.0} calls, {:.1} ms (all threads together; {:.2} us a call)",
+                "the title's threads inside our list calls (VICTORY_LIST_CALL_TIME=1), per frame: {calls:.0} calls, {:.1} ms (all threads together; {:.2} us a call); most: {}",
                 ns / 1e6,
-                if calls > 0.0 { ns / calls / 1e3 } else { 0.0 }
+                if calls > 0.0 { ns / calls / 1e3 } else { 0.0 },
+                top.join(", ")
             );
         }
         {
