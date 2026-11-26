@@ -2685,7 +2685,7 @@ pub(crate) fn let_go_idle() {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = loose_write();
         if map.is_empty() {
             return;
         }
@@ -2702,6 +2702,7 @@ pub(crate) fn let_go_idle() {
         idle.into_iter().filter_map(|key| map.remove(&key)).collect()
     };
     if !gone.is_empty() {
+        tables_changed();
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
         crate::host::trail(|| {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
@@ -4305,7 +4306,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
-        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = loose_write();
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -4324,6 +4325,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         buffers_changed();
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        tables_changed();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -4440,8 +4444,91 @@ fn remember(address: u64, end: u64, changes: u64, shadow: &Arc<Shadow>) {
     });
 }
 
+/// Counts the changes of the tables [`lookup`] reads that can change what an
+/// ask finds: a buffer registered or released, a copy taken out of a table,
+/// a window made. A thread's remembered answers ([`FOUND`]) are from one
+/// count.
+///
+/// Ours: the count is [`MAPS_CHANGED`], which every exclusive lock of the
+/// buffers' table and of the windows' map bumps as well, so a change made
+/// where the PR does not count one is counted too.
+fn tables_changed() {
+    MAPS_CHANGED.fetch_add(1, Ordering::Release);
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables.
+pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a thread remembers what its asks found
+/// (`VICTORY_LOOKUP_CACHE=0`: every ask goes to the tables, as before).
+///
+/// Every bind of a draw asks for the host copy of each buffer it reads:
+/// under the tables' one lock, among the 64 buffers that start below the
+/// address, then, for memory outside buffers, under the windows' lock. The
+/// title's six recording threads spent 54 ms a frame there together in the
+/// prologue cell (`VICTORY_PROFILE`), and asked for the same ranges again
+/// and again. A thread now keeps what each ask (address, length, kind)
+/// found, weakly (a copy nothing else holds can still be let go), for as
+/// long as the tables have not changed ([`MAPS_CHANGED`]).
+/// With it, `VICTORY_SHADOW_CACHE` (fork PR #1224) is not taken as well:
+/// the two are not stacked.
+fn found_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOKUP_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// The most asks a thread remembers before it starts again.
+const FOUND_MOST: usize = 8192;
+
+type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    /// What this thread's asks found, and the count of table changes they
+    /// are from.
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
-    lookup_as(address, len, any, lookup_cache())
+    if !found_cache() {
+        return lookup_as(address, len, any, lookup_cache());
+    }
+    let changes = MAPS_CHANGED.load(Ordering::Acquire);
+    let found = FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 != changes {
+            f.1.clear();
+            f.0 = changes;
+        }
+        f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(shadow) = found {
+        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+        if shadow.window {
+            // As `loose` notes an ask of a window it hands out.
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+            shadow.asked[1].fetch_max(address.saturating_add(len.max(1)), Ordering::Relaxed);
+            if len <= 1 {
+                shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        return Some(shadow);
+    }
+    LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = lookup_as(address, len, any, false)?;
+    FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        // (from the count read before the tables were: a change since
+        // clears it at the next ask)
+        if f.0 == changes {
+            if f.1.len() >= FOUND_MOST {
+                f.1.clear();
+            }
+            f.1.insert((address, len, any), Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
 }
 
 /// [`lookup`], with its cache ([`lookup_cache`]) or without.
@@ -4690,6 +4777,13 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Read shared by the asks that find their window there, as [`BUFFERS`] is.
 static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
+/// [`LOOSE`] exclusive; [`MAPS_CHANGED`] bumped, as [`buffers`] does (the
+/// answers threads remember, fork PRs #1224 and #1237).
+fn loose_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, u64), Arc<Shadow>>> {
+    MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
+    LOOSE.write().unwrap_or_else(|e| e.into_inner())
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, cell_len) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
@@ -4726,7 +4820,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     }
     MAPS_CHANGED.fetch_add(1, Ordering::Relaxed);
-    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let mut map = loose_write();
     // Chosen again: another thread may have made one meanwhile.
     let (start, len) = pick(&map);
     if let Some(shadow) = map.get(&(start, len)) {
@@ -4761,6 +4855,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true, false));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     // In a GPU upload heap, if asked for and there is room: one buffer in
@@ -4775,6 +4870,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -4812,6 +4908,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 
