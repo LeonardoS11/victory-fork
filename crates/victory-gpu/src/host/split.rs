@@ -96,6 +96,14 @@ pub(super) fn flush_line(frames: f64) {
 
 /// With the frame line: [`PREP_SPLIT`] per frame.
 pub(super) fn prep_line(frames: f64) {
+    if loading_flights() > 0 {
+        tracing::info!(
+            "flights capped while loading (VICTORY_LOADING_FLIGHTS={}, after {} submissions in a frame): found full {} times since the last line",
+            loading_flights(),
+            loading_after(),
+            LOADING_FULL.swap(0, Ordering::Relaxed)
+        );
+    }
     let s: Vec<f64> = PREP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     if s[prep::WHOLE] <= 0.0 {
         return;
@@ -311,4 +319,53 @@ mod tests {
         assert!(flushed.is_empty(), "an empty copy touches nothing");
         assert_eq!(left.len(), 1);
     }
+}
+
+/// The most submissions in the air while the title loads
+/// (`VICTORY_LOADING_FLIGHTS=<n>`; 0, the default, no such cap): the card
+/// was lost at the world's entry four times, the last with
+/// `VICTORY_ASYNC_SUBMIT`, while a frame sent many more submissions than
+/// the ~18 of play. A frame is taken as loading once it has sent more than
+/// [`loading_after`] submissions.
+pub(super) fn loading_flights() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_LOADING_FLIGHTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Submissions in a frame after which it is loading
+/// (`VICTORY_LOADING_AFTER`, 40).
+pub(super) fn loading_after() -> u64 {
+    static N: OnceLock<u64> = OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_LOADING_AFTER").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(40))
+}
+
+/// Times [`loading_full`] said full since the last frame line.
+static LOADING_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The frame last seen and the submissions started when it was first seen.
+static LOADING_FRAME: Mutex<(u64, u64)> = Mutex::new((u64::MAX, 0));
+
+/// Flights (submissions) among `line`'s items.
+pub(super) fn runs(line: &[Late]) -> usize {
+    line.iter().filter(|l| matches!(l, Late::Run(_))).count()
+}
+
+/// Whether `flights` in the air reach [`loading_flights`] in a frame that
+/// is loading.
+pub(super) fn loading_full(flights: usize) -> bool {
+    let most = loading_flights();
+    if most == 0 {
+        return false;
+    }
+    // (Each submission comes here: the frame's first is noted.)
+    let (frame, started) = (crate::frame::current(), STARTED.load(Ordering::Relaxed));
+    let mut seen = LOADING_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.0 != frame {
+        *seen = (frame, started);
+    }
+    let full = flights >= most && started - seen.1 > loading_after();
+    if full {
+        LOADING_FULL.fetch_add(1, Ordering::Relaxed);
+    }
+    full
 }

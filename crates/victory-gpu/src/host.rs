@@ -6578,7 +6578,7 @@ impl Host {
                 texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
-            *flying >= late_most()
+            *flying >= late_most() || split::loading_full(split::runs(items))
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
@@ -6586,7 +6586,7 @@ impl Host {
             self.settle(&mut submitted, WHY_WRITES);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
-            relay_wait(WHY_MOST, |line| line.lists < late_most());
+            relay_wait(WHY_MOST, |line| line.lists < late_most() && !split::loading_full(split::runs(&line.line)));
         } else if most {
             self.settle(&mut submitted, WHY_MOST);
         } else {
