@@ -9098,7 +9098,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
-        self.flush();
+        self.flush_before_copy(at, at + len);
         self.textures.clear();
         let end = at + len;
         self.current.retain(|_, entry| {

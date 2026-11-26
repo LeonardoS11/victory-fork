@@ -77,6 +77,12 @@ pub(super) fn flush_line(frames: f64) {
         s[4] / 1e6,
         s[6] / 1e6
     );
+    if flush_overlap() {
+        let [none, left] = [0, 1].map(|i| OVERLAP[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "title copies at submission (VICTORY_FLUSH_OVERLAP=1), per frame: {none:.0} flushed no refresh, {left:.0} refreshes left pending past one"
+        );
+    }
 }
 
 /// With the frame line: [`PREP_SPLIT`] per frame.
@@ -130,5 +136,51 @@ pub(super) fn list_calls_line(frames: f64) {
             if calls > 0.0 { ns / calls / 1e3 } else { 0.0 },
             top.join(", ")
         );
+    }
+}
+
+/// Whether a title buffer copy at submission flushes only the pending
+/// refreshes whose range touches the bytes it writes
+/// (`VICTORY_FLUSH_OVERLAP=1`; off by default: every pending refresh, as
+/// before). The order that matters is theirs alone: a refresh recorded
+/// before the copy reads those bytes as they were. The others stay pending
+/// for the submission's last flush, or the next one that needs them, and
+/// read title memory the copy did not change. A flush before every such
+/// copy was hundreds of small flushes a frame, each asking the write watch
+/// and the guards again.
+pub(crate) fn flush_overlap() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FLUSH_OVERLAP").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line, with [`flush_overlap`]: title copies that
+/// flushed nothing, and refreshes left pending past a title copy.
+pub(super) static OVERLAP: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Batch {
+    /// Before a title buffer copy that writes `[at, end)`: the pending
+    /// refreshes are done, or with [`flush_overlap`] only those whose range
+    /// touches it.
+    pub(super) fn flush_before_copy(&mut self, at: usize, end: usize) {
+        if !flush_overlap() {
+            self.flush();
+            return;
+        }
+        let (touching, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refreshes)
+            .into_iter()
+            .partition(|r| r.1 < end && at < r.2);
+        OVERLAP[1].fetch_add(rest.len() as u64, Ordering::Relaxed);
+        if touching.is_empty() {
+            OVERLAP[0].fetch_add(1, Ordering::Relaxed);
+            self.refreshes = rest;
+            return;
+        }
+        self.refreshes = touching;
+        self.flush();
+        // (`flush` emptied the index with the list.)
+        self.refreshes = rest;
+        for (at, r) in self.refreshes.iter().enumerate() {
+            self.index.insert(std::sync::Arc::as_ptr(&r.0) as usize, at);
+        }
     }
 }
